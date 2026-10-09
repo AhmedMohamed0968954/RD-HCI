@@ -1,0 +1,6 @@
+-r epic_starter/requirements.txt
+pandas>=2.2,<4
+Pillow>=11,<13
+tqdm>=4.66,<5
+# Install a suitable PyTorch build separately; CPU is sufficient for this stage.
+# VSC check job installs the CPU build in a dedicated environment.

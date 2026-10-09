@@ -282,3 +282,7 @@ auth-*/
 *.key
 # Machine-specific operational notes
 STATUS.md
+
+# This data directory contains Python source, not dataset files.
+!epic_starter/data/
+!epic_starter/data/*.py

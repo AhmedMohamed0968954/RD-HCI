@@ -32,3 +32,7 @@ auth-*/
 *.key
 # Machine-specific operational notes
 STATUS.md
+
+# Track the small Python data modules.
+!data/
+!data/*.py
