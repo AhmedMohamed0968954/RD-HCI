@@ -21,13 +21,14 @@ RD-HCI/
       manifests.py          # Shared split and metadata
       sampling.py           # Timestamp-based frame sampling
       __init__.py
-    tests/                  # Core pipeline tests
   scripts/
     extract_clips.py         # Optional AR clip export
     probe_videos.py          # Header/first-frame health audit
     check_data.py            # Batch checks, contact sheets and worker measurements
     check_data.slurm         # Complete CPU data check on VSC
-  tests/                    # Dataset/exporter integration tests
+  tests/                    # All project tests
+    test_epic.py            # Core pipeline and metric tests
+    test_data_integration.py # Dataset/exporter integration tests
   docs/                     # Guides, validation evidence and team workflow
   requirements-data.txt
   requirements-data-vsc.lock.txt
@@ -36,7 +37,7 @@ RD-HCI/
 Run commands from this repository root, inside the project environment:
 
 ```bash
-python -m pytest epic_starter/tests tests -q
+python -m pytest tests -q
 python -m epic_starter.epic_pipeline --help
 python scripts/check_data.py --help
 # On VSC, review the account and path settings first:

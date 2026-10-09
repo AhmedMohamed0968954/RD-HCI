@@ -36,7 +36,7 @@ python -m pip install --disable-pip-version-check 'torch==2.14.1' --index-url ht
 python -m pip install --disable-pip-version-check -r requirements-data.txt
 RUN_ID="data-${SLURM_JOB_ID}"
 python -m pip freeze > "$EPIC_PROJECT/logs/requirements-$RUN_ID.txt"
-python -m pytest epic_starter/tests tests -q
+python -m pytest tests -q
 HEALTH_REPORT="$EPIC_PROJECT/logs/video-health-$RUN_ID.json"
 HEALTH_FAILED=0
 if ! python scripts/probe_videos.py \

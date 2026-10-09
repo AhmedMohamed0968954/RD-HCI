@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pytest
-from epic_pipeline import Event, Window, observation, decode_window, sample_event, grouped_split, training_priors, prepare, load_events
-from epic_metrics import evaluate, validate_predictions, save_submission
+from epic_starter.epic_pipeline import Event, Window, observation, decode_window, sample_event, grouped_split, training_priors, prepare, load_events
+from epic_starter.epic_metrics import evaluate, validate_predictions, save_submission
 
 @pytest.fixture
 def video(tmp_path):

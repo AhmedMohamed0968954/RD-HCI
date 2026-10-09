@@ -25,7 +25,7 @@ for this entire data stage), then run:
 
 ```bash
 python -m pip install -r requirements-data.txt
-python -m pytest epic_starter/tests tests -q
+python -m pytest tests -q
 ```
 
 The optional exporter also requires the `ffmpeg` executable. PyAV handles direct
@@ -156,7 +156,7 @@ The job uses the CPU batch partition by default. It does not stop or require
 your OnDemand session.
 
 The job requests five CPUs, 12 GB RAM and 30 minutes, installs CPU dependencies,
-runs both test suites, generates a fresh split and checks real batches. Edit the
+runs all project tests, generates a fresh split and checks real batches. Edit the
 account/log paths for your VSC account. It does not train a model. If health checks found unreadable videos, it completes
 inspection on the explicitly identified readable subset, then exits with code 2
 and DATASET_HEALTH_BLOCKED. This is a data blocker, not a passing full-dataset
