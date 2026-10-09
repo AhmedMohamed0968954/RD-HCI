@@ -6,6 +6,36 @@ __pycache__/
 # C extensions
 *.so
 
+
+# Video files
+*.mp4
+*.MP4
+*.mkv
+*.avi
+*.tar
+*.tar.gz
+*.zip
+
+# Directories containing raw videos or extracted clips
+videos/
+EPIC-KITCHENS/
+train_clips/
+clips_train/
+data/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.ckpt
+
+# Python environment and caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+
 # Distribution / packaging
 .Python
 build/
