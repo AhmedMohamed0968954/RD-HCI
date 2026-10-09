@@ -7,11 +7,15 @@ import argparse
 import json
 import re
 import uuid
+import sys
+from pathlib import Path
+
+# Support direct execution from scripts/ as well as python -m scripts.extract_clips.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from epic_starter.data.events import Event, load_events, observation, seconds
 from epic_starter.data.manifests import read_manifest
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
-from pathlib import Path
 import subprocess
 import pandas as pd
 from tqdm import tqdm

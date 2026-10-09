@@ -12,14 +12,18 @@ Read [the data pipeline guide](docs/DATA_PIPELINE.md) for setup and commands,
 
 ```text
 RD-HCI/
-  dataset.py                  # Dataset and DataLoader; original teammate entry point
-  extract_clips.py            # Optional AR clip export; original CLI retained
   epic_starter/
     epic_pipeline.py         # prepare/sample CLI
     epic_metrics.py          # Metric helpers; course scorer alignment still required
-    data/                   # Event windows, manifests and timestamp-based sampling
+    data/
+      dataset.py            # Dataset and DataLoader
+      events.py             # Annotation parsing and AR/STA windows
+      manifests.py          # Shared split and metadata
+      sampling.py           # Timestamp-based frame sampling
+      __init__.py
     tests/                  # Core pipeline tests
   scripts/
+    extract_clips.py         # Optional AR clip export
     probe_videos.py          # Header/first-frame health audit
     check_data.py            # Batch checks, contact sheets and worker measurements
     check_data.slurm         # Complete CPU data check on VSC

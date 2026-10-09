@@ -1,8 +1,7 @@
 # AR / STA data pipeline: step-by-step guide
 
 The pipeline is a sequence of small steps, not a requirement to keep everything
-in one Python file. The original Dataset and clip-export entry points remain at
-the repository root. Shared rules are implemented once in `epic_starter/data/`.
+in one Python file. The Dataset lives in `epic_starter/data/`; executable tools live in `scripts/`. Shared rules are implemented once in `epic_starter/data/`.
 
 ## Read the code in this order
 
@@ -11,9 +10,9 @@ the repository root. Shared rules are implemented once in `epic_starter/data/`.
 | 1 | `epic_starter/data/events.py` | Parse CSV; represent one event; calculate AR/STA windows |
 | 2 | `epic_starter/data/manifests.py` | Index videos; split by video; save manifests, statistics and priors |
 | 3 | `epic_starter/data/sampling.py` | Decode original video and sample legal frames using PTS |
-| 4 | `dataset.py` | Convert one event into a Tensor sample; create DataLoader batches |
+| 4 | `epic_starter/data/dataset.py` | Convert one event into a Tensor sample; create DataLoader batches |
 | 5 | `scripts/check_data.py` | Check complete batches, export contact sheets, benchmark workers |
-| Optional | `extract_clips.py` | Export standalone AR clips for inspection or a chosen AR cache |
+| Optional | `scripts/extract_clips.py` | Export standalone AR clips for inspection or a chosen AR cache |
 
 `epic_pipeline.py` remains a small CLI and compatibility layer. Existing
 `from epic_pipeline import sample_event` imports still work when run from its
@@ -67,7 +66,7 @@ prepare unlabeled test manifests. No public test labels are used as a substitute
 ## 2. Read samples and batches
 
 ```python
-from dataset import EpicKitchensDataset, make_dataloader
+from epic_starter.data.dataset import EpicKitchensDataset, make_dataloader
 
 # Use train_sta.jsonl for STA; the manifest carries its observation window.
 dataset = EpicKitchensDataset(
@@ -168,7 +167,7 @@ validation. This is the single maintained Slurm entry point for data checks.
 The original CLI is preserved:
 
 ```bash
-python extract_clips.py \
+python scripts/extract_clips.py \
   --csv_path "$EPIC_PROJECT/annotations/EPIC_100_train.csv" \
   --video_dir "$EPIC_WORK/EPIC-KITCHENS/videos_640x360" \
   --output_dir "$EPIC_WORK/ar_preview_clips" \

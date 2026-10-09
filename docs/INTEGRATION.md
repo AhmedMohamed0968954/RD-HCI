@@ -2,11 +2,11 @@
 
 ## What stayed familiar
 
-- `dataset.py` is still the Dataset entry point.
+- `epic_starter/data/dataset.py` is the Dataset module; its class and function interfaces are preserved.
 - `EpicKitchensDataset(manifest_csv, num_frames=16, transform=None)` keeps the same first three arguments.
 - `__len__`, `__getitem__` and `_sample_indices` remain recognizable.
 - Samples still contain `video`, `verb_label`, `noun_label` and `narration_id`.
-- `extract_clips.py`, `find_source_video`, `trim_segment` and the original command-line arguments remain.
+- `scripts/extract_clips.py`, `find_source_video`, `trim_segment` and the original command-line arguments remain.
 - Existing `epic_pipeline.py prepare/sample` commands remain available.
 
 ## Deliberate changes
@@ -34,3 +34,15 @@ The annotation CSV and old partial clip manifest are local data, excluded from
 new commits. Their local contents remain unchanged; no history was rewritten.
 The downloader and authentication files stay outside the repository. No full clip
 export or model training is triggered by this integration.
+
+## Import and command paths after directory cleanup
+
+Import the Dataset with:
+
+```python
+from epic_starter.data.dataset import EpicKitchensDataset, make_dataloader
+```
+
+Run optional AR export with `python scripts/extract_clips.py ...` from the
+repository root. The original CLI options and function names are unchanged.
+Update older notebooks that import `dataset` or invoke the root-level script.

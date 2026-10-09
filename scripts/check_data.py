@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import Subset
-from dataset import EpicKitchensDataset, make_dataloader
+from epic_starter.data.dataset import EpicKitchensDataset, make_dataloader
 from epic_starter.data.events import load_events, seconds
 from epic_starter.data.manifests import read_manifest
 

@@ -12,7 +12,7 @@ import av
 import numpy as np
 import pytest
 import torch
-from dataset import EpicKitchensDataset, make_dataloader
+from epic_starter.data.dataset import EpicKitchensDataset, make_dataloader
 from epic_starter.data.manifests import prepare, read_manifest
 from scripts.check_data import audit_legacy_manifest, validate_batch, verify_splits
 
@@ -147,7 +147,7 @@ def test_export_failure_is_retained(project,tmp_path):
     rows[0]["video_id"]="missing"
     broken=tmp_path/"broken.csv";write_rows(broken,[rows[0]])
     manifest=tmp_path/"failed.csv"
-    result=subprocess.run([sys.executable,str(ROOT/"extract_clips.py"),"--csv_path",str(broken),
+    result=subprocess.run([sys.executable,str(ROOT/"scripts"/"extract_clips.py"),"--csv_path",str(broken),
                            "--video_dir",str(videos),"--output_dir",str(tmp_path/"clips"),
                            "--output_csv",str(manifest)],capture_output=True,text=True)
     assert result.returncode==1,result.stderr
@@ -161,14 +161,14 @@ def test_export_failure_is_retained(project,tmp_path):
 def test_real_export_and_reuse(project,tmp_path):
     csv_path,videos,_=project
     manifest=tmp_path/"clips.csv"
-    args=[sys.executable,str(ROOT/"extract_clips.py"),"--csv_path",str(csv_path),
+    args=[sys.executable,str(ROOT/"scripts"/"extract_clips.py"),"--csv_path",str(csv_path),
           "--video_dir",str(videos),"--output_dir",str(tmp_path/"clips"),
           "--output_csv",str(manifest),"--limit","2"]
     subprocess.run(args,check=True,capture_output=True)
     with pytest.warns(UserWarning):
         ds=EpicKitchensDataset(str(manifest),4,image_size=32)
     assert len(ds)==2 and ds[0]["frames"].shape==(4,3,32,32)
-    from extract_clips import trim_segment
+    from scripts.extract_clips import trim_segment
     with csv_path.open() as f:
         row=next(csv.DictReader(f))
     _,clip,error=trim_segment(row,str(videos),str(tmp_path/"clips"),False)
