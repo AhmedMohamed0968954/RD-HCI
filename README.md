@@ -1,36 +1,70 @@
-# RD-HCI
-This is the repository used by one of the teams within the project of HCI in the R&amp;D Course in KU Leuven
+# RD-HCI: EPIC-KITCHENS AR and STA
 
-## Known data issue
+Shared video-only data pipeline for the KU Leuven R&D course project.
+AR reads the target action segment. STA reads only frames at least one second
+before the action starts. Model training remains the next team task.
 
-The full video header/first-frame check found 20 unreadable files affecting 5,923
-annotated events. Code tests pass, but full-dataset training needs corrected data.
-See [validation details](epic_starter/DATA_VALIDATION.md). No events were removed.
+## Start here
 
-## Runnable data pipeline
+Read [the data pipeline guide](docs/DATA_PIPELINE.md) for setup and commands,
+[team tasks](docs/TEAM_TASKS.md) for ownership, and
+[integration notes](docs/INTEGRATION.md) for the existing Dataset interface.
 
-The shared data stage now supports both Action Recognition (AR) and Short-Term
-Action Anticipation (STA). Read [the step-by-step guide](epic_starter/README.md).
+```text
+RD-HCI/
+  dataset.py                  # Dataset and DataLoader; original teammate entry point
+  extract_clips.py            # Optional AR clip export; original CLI retained
+  epic_starter/
+    epic_pipeline.py         # prepare/sample CLI
+    epic_metrics.py          # Metric helpers; course scorer alignment still required
+    data/                   # Event windows, manifests and timestamp-based sampling
+    tests/                  # Core pipeline tests
+  scripts/
+    probe_videos.py          # Header/first-frame health audit
+    check_data.py            # Batch checks, contact sheets and worker measurements
+    check_data.slurm         # Complete CPU data check on VSC
+  tests/                    # Dataset/exporter integration tests
+  docs/                     # Guides, validation evidence and team workflow
+  requirements-data.txt
+  requirements-data-vsc.lock.txt
+```
 
-- `dataset.py`: the existing `EpicKitchensDataset`, now connected to the shared sampler.
-- `extract_clips.py`: the existing optional AR exporter; original arguments retained.
-- `epic_starter/data/`: small modules for annotations, manifests and frame sampling.
-- `scripts/check_data.py`: batch validation, sample images and worker benchmarks.
+Run commands from this repository root, inside the project environment:
 
 ```bash
-# Run from this repository root, inside the project's Python environment.
 python -m pytest epic_starter/tests tests -q
 python -m epic_starter.epic_pipeline --help
 python scripts/check_data.py --help
+# On VSC, review the account and path settings first:
+sbatch -M wice scripts/check_data.slurm
 ```
 
-On VSC, `sbatch -M wice scripts/check_data.slurm` prepares a CPU environment and
-checks real data. Read its account/path settings before use.
+## Code and data locations
 
-The committed legacy `EPIC_100_train_manifest.csv` is a partial AR clip export,
-not the canonical training split. Generate shared train/validation JSONL manifests
-with `prepare`; do not divide classes or videos independently between team members.
+The working repository on the current VSC account is:
+`/data/leuven/394/vsc39484/epic-kitchens/code/RD-HCI`.
+Work here and push this repository; do not copy edits between two starter folders.
 
-No model architecture or training loop is included in this data-stage integration.
-See [integration notes](epic_starter/INTEGRATION.md) for preserved interfaces and
-[remaining team work](epic_starter/TEAM_TASKS.md).
+- Course annotations: `$EPIC_PROJECT/annotations/`
+- Videos: `$EPIC_WORK/EPIC-KITCHENS/videos_640x360/`
+- Generated manifests, logs and previews: outside this repository
+- Temporary download/repair utilities: outside this repository
+
+Here `EPIC_PROJECT=/data/leuven/394/vsc39484/epic-kitchens` and
+`EPIC_WORK=/lustre1/scratch/394/vsc39484/epic-kitchens`.
+Other team members must configure paths they can access.
+
+Course CSVs and generated clip manifests are not part of the source distribution.
+Obtain annotations from the course and generate the shared grouped split with
+`prepare`. The old partial clip manifest is optional for diagnostic comparison.
+
+## Validation status
+
+The initial check found 20 unreadable videos affecting 5,923 course events.
+Recovery is in progress; P22_110 passed complete decode and timing checks.
+The remaining repair array and dependent full-pipeline check must finish before
+claiming the data blocker resolved. See [validation details](docs/DATA_VALIDATION.md).
+No course labels or split membership were changed.
+
+See [Git workflow](docs/GITHUB.md) before contributing. Keep videos, annotations,
+credentials, generated results and environments out of Git.

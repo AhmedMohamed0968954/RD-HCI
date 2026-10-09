@@ -1,6 +1,8 @@
--r epic_starter/requirements.txt
+# Install a suitable PyTorch build separately; CPU works for data preparation.
+# The VSC check job installs PyTorch in its dedicated CPU environment.
+av==19.0.1
+numpy>=2.1,<3
 pandas>=2.2,<4
 Pillow>=11,<13
 tqdm>=4.66,<5
-# Install a suitable PyTorch build separately; CPU is sufficient for this stage.
-# VSC check job installs the CPU build in a dedicated environment.
+pytest>=8,<10

@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=epic-data-check
 #SBATCH --clusters=wice
-#SBATCH --partition=interactive
+#SBATCH --partition=batch_icelake
 #SBATCH --account=intro_vsc39484
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -51,12 +51,17 @@ python -m epic_starter.epic_pipeline prepare \
   --train-csv "$EPIC_PROJECT/annotations/EPIC_100_train.csv" \
   --video-root "$EPIC_WORK/EPIC-KITCHENS/videos_640x360" \
   --out-dir "$EPIC_PROJECT/manifests/$RUN_ID" --seed 42 --context 5
+# An old partial clip manifest is optional and never defines the shared split.
+LEGACY_ARGS=()
+if [[ -f EPIC_100_train_manifest.csv ]]; then
+    LEGACY_ARGS=(--legacy-manifest EPIC_100_train_manifest.csv)
+fi
 python scripts/check_data.py \
   --manifest-dir "$EPIC_PROJECT/manifests/$RUN_ID" \
   --video-root "$EPIC_WORK/EPIC-KITCHENS/videos_640x360" \
   --out-dir "$EPIC_PROJECT/previews/$RUN_ID" \
   --annotation-csv "$EPIC_PROJECT/annotations/EPIC_100_train.csv" \
-  --legacy-manifest EPIC_100_train_manifest.csv \
+  "${LEGACY_ARGS[@]}" \
   --health-report "$HEALTH_REPORT" \
   --samples 16 --workers 0 2 4 --batch-size 4
 echo "DATA_PIPELINE_CHECK_COMPLETE"

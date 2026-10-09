@@ -30,6 +30,7 @@ one stage without navigating a single large file or implementing timing twice.
 
 ## Files not rewritten
 
-The original committed annotation CSV and partial clip manifest remain unchanged.
+The annotation CSV and old partial clip manifest are local data, excluded from
+new commits. Their local contents remain unchanged; no history was rewritten.
 The downloader and authentication files stay outside the repository. No full clip
 export or model training is triggered by this integration.

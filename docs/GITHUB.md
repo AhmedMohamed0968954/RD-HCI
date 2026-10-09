@@ -20,8 +20,9 @@ GitHub does not grant access to another team member's VSC files.
 
 Keep Python modules, scripts, tests and documentation in Git. Videos, environments,
 credentials, generated splits, previews, clip caches and models stay outside the
-repository. The data/ Python source modules are explicitly allowed by .gitignore.
-The original committed CSV files were not changed by this integration.
+repository. Only the root data/ storage directory is ignored; epic_starter/data/ is source
+code. Course CSV files are excluded from new commits and remain local. Existing
+Git history has not been rewritten.
 
 The old standalone /code/epic_starter directory is a historical copy. Continue
 working in /code/RD-HCI; do not manually copy between two active code folders.

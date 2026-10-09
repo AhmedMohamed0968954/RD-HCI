@@ -2,7 +2,7 @@
 
 The pipeline is a sequence of small steps, not a requirement to keep everything
 in one Python file. The original Dataset and clip-export entry points remain at
-the repository root. Shared rules are implemented once in `data/`.
+the repository root. Shared rules are implemented once in `epic_starter/data/`.
 
 ## Read the code in this order
 
@@ -131,7 +131,6 @@ python scripts/check_data.py \
   --video-root "$EPIC_WORK/EPIC-KITCHENS/videos_640x360" \
   --out-dir "$EPIC_PROJECT/previews/$RUN_ID" \
   --annotation-csv "$EPIC_PROJECT/annotations/EPIC_100_train.csv" \
-  --legacy-manifest EPIC_100_train_manifest.csv \
   --health-report "$EPIC_PROJECT/logs/health-$RUN_ID.json" \
   --samples 16 --workers 0 2 4 --batch-size 4
 ```
@@ -139,8 +138,9 @@ python scripts/check_data.py \
 Allocate at least five CPU cores for workers 0/2/4. The checker verifies split
 isolation, AR/STA event alignment, labels, shapes, finite inputs, timestamp bounds,
 empty-history handling and exact sample coverage. PNG contact sheets and JSON
-metadata make the sampled frames reviewable. It audits the old partial clip CSV
-without requiring those exported clips to be present on every machine.
+metadata make the sampled frames reviewable. If you still have the old partial clip CSV, optionally pass
+`--legacy-manifest /path/to/EPIC_100_train_manifest.csv` to audit it.
+That generated file is not distributed with the code.
 
 Worker timings use the same events and include process startup and decoding.
 Later passes may benefit from filesystem caches, so this small benchmark is a
@@ -153,17 +153,15 @@ For a single repeatable VSC job, run from the repository root:
 sbatch -M wice scripts/check_data.slurm
 ```
 
-If an existing OnDemand session triggers an interactive node limit, submit with
-`sbatch -M wice --partition=batch_icelake scripts/check_data.slurm` instead.
-This uses the configured compute account; it does not stop your interactive session.
+The job uses the CPU batch partition by default. It does not stop or require
+your OnDemand session.
 
 The job requests five CPUs, 12 GB RAM and 30 minutes, installs CPU dependencies,
 runs both test suites, generates a fresh split and checks real batches. Edit the
 account/log paths for your VSC account. It does not train a model. If health checks found unreadable videos, it completes
 inspection on the explicitly identified readable subset, then exits with code 2
 and DATASET_HEALTH_BLOCKED. This is a data blocker, not a passing full-dataset
-validation. The old
-`epic_starter/check_on_vsc.slurm` remains a smaller preprocessing-only check.
+validation. This is the single maintained Slurm entry point for data checks.
 
 ## 5. Optional AR clip export
 
