@@ -65,9 +65,13 @@ def decode_window(path: Path | None, window: Window, num_frames=8, image_size=22
                 mask[i], times[i] = True, when
     return output, mask, times
 
-def sample_event(event: Event, index, task: str, context=5., num_frames=8, image_size=224):
-    """Future Dataset entry point: compute a window, sample frames, return validity information."""
-    window = observation(event, task, context)
+def sample_event(event: Event, index, task: str, context=5., num_frames=8, image_size=224,
+                 window: Window | None = None):
+    """Dataset entry point: compute a window, sample frames, return validity information.
+    Pass window to reuse one stored in a prepared manifest instead of recomputing it.
+    """
+    if window is None:
+        window = observation(event, task, context)
     frames, valid, times = decode_window(index.get(event.video_id), window, num_frames, image_size)
     if task == "AR" and not valid.any():
         raise ValueError("AR interval has no decodable frames: " + event.narration_id)

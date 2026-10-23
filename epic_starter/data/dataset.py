@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, default_collate
 from epic_starter.data.events import Event, Window, load_events, observation
 from epic_starter.data.manifests import read_manifest, video_index
-from epic_starter.data.sampling import decode_window, sample_event
+from epic_starter.data.sampling import sample_event
 
 
 class EpicKitchensDataset(Dataset):
@@ -104,14 +104,10 @@ class EpicKitchensDataset(Dataset):
                   else observation(event,self.task,self.context))
         if self.source == "clips":
             clip = self._read_clip(idx)
-        elif self.records:
-            frames,valid,times = decode_window(self.index[event.video_id],window,self.num_frames,self.image_size)
-            if self.task == "AR" and not valid.any():
-                raise ValueError("AR interval contains no frames: " + event.narration_id)
-            clip = dict(frames=frames,valid_mask=valid,frame_times_seconds=times,
-                        use_prior=bool(self.task == "STA" and not valid.any()))
         else:
-            clip = sample_event(event,self.index,self.task,self.context,self.num_frames,self.image_size)
+            # Original videos: JSONL and CSV inputs share one sampler; only the window source differs.
+            clip = sample_event(event,self.index,self.task,self.context,self.num_frames,self.image_size,
+                                window=window)
         frames = torch.from_numpy(clip["frames"]).permute(0,3,1,2).contiguous()
         if self.transform is not None and not clip["use_prior"]:
             frames = self.transform(frames)

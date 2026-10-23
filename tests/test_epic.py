@@ -58,6 +58,13 @@ def test_missing_ar_video_is_error():
     with pytest.raises(FileNotFoundError):
         sample_event(event(), {}, "AR")
 
+def test_prepared_window_is_used_instead_of_recomputed(video):
+    # A manifest window [0.2, 0.5] must be honoured, not the default STA window [0, 1].
+    result = sample_event(event(), {"P01_01": video}, "STA", num_frames=4, image_size=32,
+                          window=Window(.2, .5, True))
+    assert result["valid_mask"].all() and not result["use_prior"]
+    assert (result["frame_times_seconds"] >= .2).all() and (result["frame_times_seconds"] <= .5).all()
+
 def test_variable_rate_and_nonzero_stream_origin(tmp_path):
     import av
     path = tmp_path / "vfr.mp4"
