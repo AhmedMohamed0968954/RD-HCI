@@ -2,22 +2,22 @@
 #SBATCH --job-name=epic-data-check
 #SBATCH --clusters=wice
 #SBATCH --partition=batch_icelake
-#SBATCH --account=intro_vsc39484
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=5
 #SBATCH --mem=12G
 #SBATCH --time=00:30:00
 #SBATCH --export=NONE
-#SBATCH --output=/data/leuven/394/vsc39484/epic-kitchens/logs/data-check-%j.out
-#SBATCH --error=/data/leuven/394/vsc39484/epic-kitchens/logs/data-check-%j.err
 
-# Submit from the repository root. Each job writes to a fresh output directory.
-# The account and log paths above belong to the current dataset owner.
+# Submit from the repository root with your own compute account and log path:
+#   sbatch -M wice -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/data-check-%j.out" scripts/check_data.slurm
+# Paths default to your own VSC storage; override them in ~/.bashrc if needed.
+# Each job writes to a fresh output directory.
 set -euo pipefail
 umask 077
-export EPIC_PROJECT=/data/leuven/394/vsc39484/epic-kitchens
-export EPIC_WORK=/lustre1/scratch/394/vsc39484/epic-kitchens
+export EPIC_PROJECT="${EPIC_PROJECT:-${VSC_DATA:?VSC_DATA is not set}/epic-kitchens}"
+export EPIC_WORK="${EPIC_WORK:-${VSC_SCRATCH_LUSTRE1:-${VSC_SCRATCH:?VSC_SCRATCH is not set}}/epic-kitchens}"
+mkdir -p "$EPIC_PROJECT/logs"
 export PIP_CACHE_DIR="$EPIC_PROJECT/cache/pip"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1

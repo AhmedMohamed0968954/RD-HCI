@@ -38,12 +38,10 @@ at `$EPIC_PROJECT/envs/epic-data-20261009`, preserving the earlier environment.
 ## 1. Prepare one shared split
 
 Run these commands from the repository root on VSC. Decoding and benchmarks belong
-on allocated compute resources. Paths below refer to the current dataset owner;
-other members need access to that storage or their own data paths.
+on allocated compute resources. `EPIC_PROJECT` and `EPIC_WORK` are your own
+settings from `~/.bashrc` (see the README); point them at data you can access.
 
 ```bash
-export EPIC_PROJECT=/data/leuven/394/vsc39484/epic-kitchens
-export EPIC_WORK=/lustre1/scratch/394/vsc39484/epic-kitchens
 export RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 module load Python/3.13.1-GCCcore-14.2.0
 source "$EPIC_PROJECT/envs/epic-data-20261009/bin/activate"
@@ -149,7 +147,7 @@ count and prefetching are bounded; each decoder uses one thread.
 For a single repeatable VSC job, run from the repository root:
 
 ```bash
-sbatch -M wice scripts/check_data.slurm
+sbatch -M wice -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/data-check-%j.out" scripts/check_data.slurm
 ```
 
 The job uses the CPU batch partition by default. It does not stop or require

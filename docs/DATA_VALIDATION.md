@@ -86,7 +86,7 @@ benchmark a longer run on the intended training hardware before increasing it.
 
 ## VSC artifacts
 
-Under `/data/leuven/394/vsc39484/epic-kitchens`:
+Under the dataset owner's `$EPIC_PROJECT`:
 
 - `logs/data-check-62273213.out` and `.err`
 - `logs/video-health-data-62273213.json` (includes affected event IDs)

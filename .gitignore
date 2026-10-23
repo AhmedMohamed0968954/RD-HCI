@@ -33,6 +33,7 @@ envs/
 *.ckpt
 *.zip
 *.tar
+slurm-*.out
 *.tar.gz
 *.log
 # Authentication and machine-local configuration

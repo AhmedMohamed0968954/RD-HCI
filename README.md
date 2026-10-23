@@ -40,24 +40,30 @@ Run commands from this repository root, inside the project environment:
 python -m pytest tests -q
 python -m epic_starter.epic_pipeline --help
 python scripts/check_data.py --help
-# On VSC, review the account and path settings first:
-sbatch -M wice scripts/check_data.slurm
+# On VSC, with your own account (see "Code and data locations"):
+sbatch -M wice -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/data-check-%j.out" scripts/check_data.slurm
 ```
 
 ## Code and data locations
 
-The working repository on the current VSC account is:
-`/data/leuven/394/vsc39484/epic-kitchens/code/RD-HCI`.
-Work here and push this repository; do not copy edits between two starter folders.
+Each member sets these once in `~/.bashrc` on VSC (values are personal, never commit them):
+
+```bash
+export EPIC_PROJECT="$VSC_DATA/epic-kitchens"              # code, annotations, envs, manifests
+export EPIC_WORK="$VSC_SCRATCH_LUSTRE1/epic-kitchens"      # videos and scratch outputs
+export EPIC_ACCOUNT="<your Slurm compute account>"          # see: sam-balance
+```
+
+Keep your clone at `$EPIC_PROJECT/code/RD-HCI`, work there and push this repository;
+do not copy edits between two code folders.
 
 - Course annotations: `$EPIC_PROJECT/annotations/`
 - Videos: `$EPIC_WORK/EPIC-KITCHENS/videos_640x360/`
 - Generated manifests, logs and previews: outside this repository
 - Temporary download/repair utilities: outside this repository
 
-Here `EPIC_PROJECT=/data/leuven/394/vsc39484/epic-kitchens` and
-`EPIC_WORK=/lustre1/scratch/394/vsc39484/epic-kitchens`.
-Other team members must configure paths they can access.
+Point `EPIC_WORK` at a video copy you can read; access to GitHub does not grant
+access to another member's VSC storage.
 
 Course CSVs and generated clip manifests are not part of the source distribution.
 Obtain annotations from the course and generate the shared grouped split with

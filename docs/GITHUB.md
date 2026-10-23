@@ -7,7 +7,7 @@ The data integration builds on the existing main branch in a separate branch,
 Review and merge through a pull request instead of replacing main directly.
 
 ```bash
-cd /data/leuven/394/vsc39484/epic-kitchens/code/RD-HCI
+cd "$EPIC_PROJECT/code/RD-HCI"
 git status
 git diff --stat
 # After reviewing and committing changes:
