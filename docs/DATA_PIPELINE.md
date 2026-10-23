@@ -20,20 +20,14 @@ folder; package users can import from `epic_starter.data.sampling`.
 
 ## Environment
 
-Python 3.13 is used on VSC. Install an appropriate PyTorch build first (CPU works
-for this entire data stage), then run:
-
-```bash
-python -m pip install -r requirements-data.txt
-python -m pytest tests -q
-```
+Set up settings, data and the Python environment with the README's
+[first-time setup](../README.md#first-time-setup-on-vsc) (route A creates the
+environment automatically; route B shows the manual commands). Run everything below
+from the repository root in a compute-node shell with that environment active.
 
 The optional exporter also requires the `ffmpeg` executable. PyAV handles direct
 video reading; torchvision is no longer required for the Dataset. Full clip
 export is not required before training.
-
-On the current VSC account, the complete check job creates a separate environment
-at `$EPIC_PROJECT/envs/epic-data-20261009`, preserving the earlier environment.
 
 ## 1. Prepare one shared split
 
