@@ -24,5 +24,4 @@ repository. Only the root data/ storage directory is ignored; epic_starter/data/
 code. Course CSV files are excluded from new commits and remain local. Existing
 Git history has not been rewritten.
 
-The old standalone /code/epic_starter directory is a historical copy. Continue
-working in /code/RD-HCI; do not manually copy between two active code folders.
+Work in your own clone at `$EPIC_PROJECT/code/RD-HCI`; do not copy edits between code folders.
