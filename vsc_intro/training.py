@@ -266,32 +266,40 @@ class LandmarkDetectorCNN(nn.Module):
         return coordinates
 
 
-def visualize_predictions(dataset, model, num_samples=5):
+def visualize_predictions(dataset, model, device, train_mode, num_samples=5):
     """
     Plots model predictions against ground truth for a few samples.
+    Eye targets are (Lx, Ly, Rx, Ry); landmark targets are 20 flattened (x, y) pairs.
     """
     model.eval()
-    fig, axes = plt.subplots(1, num_samples, figsize=(20, 5))
+    num_samples = min(num_samples, len(dataset))
+    fig, axes = plt.subplots(1, num_samples, figsize=(4 * num_samples, 5), squeeze=False)
     # Get a few random samples from the validation set
     indices = np.random.choice(len(dataset), num_samples, replace=False)
     for i, idx in enumerate(indices):
         image, labels = dataset[idx]
-        true_eyes = labels['eyes']
         # Prepare the image for the model
         image_tensor = image.unsqueeze(0).to(device) # Add a batch dimension
         # Get model prediction
         with torch.no_grad():
-            predicted_eyes = model(image_tensor).squeeze(0).cpu().numpy()
+            prediction = model(image_tensor).squeeze(0).cpu().numpy()
+        # Reshape targets and predictions to (points, 2) in the same (x, y) order
+        if train_mode == "eyes":
+            true_points = labels['eyes'].numpy().reshape(2, 2)
+            predicted_points = prediction.reshape(2, 2)
+        else:
+            true_points = labels['landmarks'].numpy()
+            predicted_points = prediction.reshape(20, 2)
         # Reshape image for plotting (C, H, W) -> (H, W)
         image_to_plot = image.squeeze(0).numpy()
-        ax = axes[i]
+        ax = axes[0, i]
         ax.imshow(image_to_plot, cmap='gray')
         # Plot ground truth (Green circles)
-        ax.scatter([true_eyes[2], true_eyes[0]], [true_eyes[3], true_eyes[1]],
-                   c='lime', marker='o', s=80, label='Ground Truth')
+        ax.scatter(true_points[:, 0], true_points[:, 1],
+                   c='lime', marker='o', s=40, label='Ground Truth')
         # Plot prediction (Red crosses)
-        ax.scatter([predicted_eyes[2], predicted_eyes[0]], [predicted_eyes[3], predicted_eyes[1]],
-                   c='red', marker='x', s=80, label='Prediction')
+        ax.scatter(predicted_points[:, 0], predicted_points[:, 1],
+                   c='red', marker='x', s=40, label='Prediction')
         ax.set_title(f"Sample {idx}")
         ax.axis('off')
     plt.legend()
@@ -345,7 +353,9 @@ if __name__ == "__main__":
     # Split into training and validation sets
     val_size = int(len(full_dataset) * val_fraction)
     train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    # A fixed seed keeps the same train/validation split across runs, so results are comparable
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size],
+                                              generator=torch.Generator().manual_seed(42))
 
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
@@ -421,4 +431,4 @@ if __name__ == "__main__":
     plt.savefig("training_validation_loss.png")
 
     if visualize:
-        visualize_predictions(val_dataset, model, num_samples=5)
+        visualize_predictions(val_dataset, model, device, train_mode, num_samples=5)

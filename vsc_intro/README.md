@@ -20,13 +20,15 @@ to you before submitting jobs.
   Run it after the setup job has finished.
 - [`requirements.txt`](./requirements.txt) lists the same Python packages. It
   is an alternative package list if you install dependencies manually; do not
-  install both lists separately.
+  install both lists separately. It adds the PyTorch package index with
+  `--extra-index-url`, so the other packages still come from PyPI.
 - [`training.py`](./training.py) loads the data, trains the
   selected model, and saves plots.
-- [`base.slurm`](./base.slurm) is the example GPU training job. It needs two
-  edits before use: its working-directory line is a placeholder, and it calls
-  `training.py`, which is not the Python filename in this folder.
-- [`BioID_FaceDatabase.zip`](./BioID_FaceDatabase.zip) contains the dataset.
+- [`base.slurm`](./base.slurm) is the example GPU training job. It runs
+  `training.py` from `$VSC_DATA/vsc-intro`; change its `cd` line if you put the
+  files somewhere else.
+- `BioID_FaceDatabase.zip` contains the dataset. It is not stored in this Git
+  repository: get it from the course materials and put it next to these files.
 
 ## Before you start
 
@@ -68,7 +70,9 @@ When the setup job is no longer listed, inspect its `slurm-<jobid>.out` file in
 the directory from which you submitted it. Resolve any reported error before
 continuing. This script downloads Miniconda into `$VSC_DATA/miniconda3` and
 adds it to your `~/.bashrc`. For a shell that was already open, load that
-configuration with `source ~/.bashrc`, or open a new login session.
+configuration with `source ~/.bashrc`, or open a new login session. It is safe
+to resubmit: it skips the installer when Miniconda is already present and adds
+the `PATH` line to `~/.bashrc` only once.
 
 ### 2. Create the Python environment (once, after setup)
 
@@ -81,9 +85,17 @@ sbatch install_libs.slurm
 
 Wait for the job to finish and check its `slurm-<jobid>.out` file. It creates
 the `rd_lab` environment with Python 3.12 and installs NumPy, Matplotlib,
-TQDM, IPython kernel support, PyTorch, and TorchVision. At the end, it prints
-whether PyTorch can see CUDA. The environment and packages persist, so this step
-does not need to be repeated for every training run.
+TQDM, IPython kernel support, PyTorch, and TorchVision. The environment and
+packages persist, so this step does not need to be repeated for every training
+run.
+
+PyTorch comes from the CUDA 12.6 package index and is kept below version 2.15.
+The P100 GPUs used here are Pascal GPUs (compute capability 6.0), and PyTorch's
+CUDA 12.8/12.9 builds no longer include Pascal kernels; 2.14 is the last release
+with CUDA 12.6 builds. At the end, the job runs a small computation on the GPU
+and prints the GPU name: an error there means the PyTorch build does not support
+the GPU. pip's download cache goes to `$VSC_DATA/.cache/pip`, because the CUDA
+packages are several GB and would fill the 3 GB `$VSC_HOME` quota.
 
 ### 3. Put the data in place 
 
@@ -163,6 +175,12 @@ Submit the edited script with `sbatch base.slurm` as before.
 - Setup and package installation are also submitted as Slurm jobs in these
   examples. They request the GPU partition even though their work is not GPU
   computation because we want pytorch to be installed with CUDA support. 
+- The `cluster/wice/gpu_p100` module matches the `gpu_p100` partition. Load the
+  module that matches the partition you request, so software modules are built
+  for that node's CPU.
+- For newer GPUs (for example A100 or H100 partitions), newer CUDA builds of
+  PyTorch work; the CUDA 12.6 pin is only needed for the P100.
 - Training plots are saved, but the Python example does not save a model
-  checkpoint.
+  checkpoint. The train/validation split uses a fixed seed, so repeated runs use
+  the same split.
 - Do not run long or GPU-intensive training directly on a login node.

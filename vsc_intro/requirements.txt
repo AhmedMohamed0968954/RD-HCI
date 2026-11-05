@@ -2,6 +2,8 @@ numpy
 matplotlib
 tqdm
 ipykernel
-torch
+torch<2.15
 torchvision
---index-url https://download.pytorch.org/whl/cu129
+# P100 GPUs (sm_60) need PyTorch's CUDA 12.6 builds; 2.14 is the last release that ships them.
+# --extra-index-url keeps PyPI available for the other packages (they are not on the PyTorch index).
+--extra-index-url https://download.pytorch.org/whl/cu126

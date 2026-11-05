@@ -14,13 +14,16 @@ cd $VSC_DATA
 module load cluster/wice/gpu_p100
 
 
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O $VSC_DATA/Miniconda3-latest-Linux-x86_64.sh
-# It is important to use $VSC_DATA to store your conda installation since 
-# environments tend to be large, and your quota in $VSC_HOME would be exceeded soon.
-bash Miniconda3-latest-Linux-x86_64.sh -b -p $VSC_DATA/miniconda3
+# Skip the download and installation if Miniconda is already there, so the job is safe to resubmit.
+if [ ! -x "$VSC_DATA/miniconda3/bin/conda" ]; then
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O $VSC_DATA/Miniconda3-latest-Linux-x86_64.sh
+    # It is important to use $VSC_DATA to store your conda installation since
+    # environments tend to be large, and your quota in $VSC_HOME would be exceeded soon.
+    bash Miniconda3-latest-Linux-x86_64.sh -b -p $VSC_DATA/miniconda3
+fi
 
-# Add line in .bashrc to put conda in PATH
-echo 'export PATH="$VSC_DATA/miniconda3/bin:$PATH"' >> ~/.bashrc
+# Add line in .bashrc to put conda in PATH (only once, so resubmitting does not duplicate it)
+grep -qxF 'export PATH="$VSC_DATA/miniconda3/bin:$PATH"' ~/.bashrc || echo 'export PATH="$VSC_DATA/miniconda3/bin:$PATH"' >> ~/.bashrc
 
 export PATH="$VSC_DATA/miniconda3/bin:$PATH"
 

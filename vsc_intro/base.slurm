@@ -9,7 +9,7 @@
 #SBATCH --time=15:00
 #SBATCH --job-name=vsc_intro_training
 
-module load cluster/wice/interactive
+module load cluster/wice/gpu_p100
 
 conda activate rd_lab
 
