@@ -2,9 +2,11 @@
 
 **Course:** R&D Experience (HCVISION) — Academic Year 2026–2027
 
-**Dataset:** EPIC-KITCHENS-100 (Video-Only Modality, $640 \times 360$, \~17 GB)
+**Dataset:** EPIC-KITCHENS-100 (Video-Only Modality, $640 \times 360$, 700 videos, ≈49 GiB on VSC; the course page's \~17 GB figure is too low)
 
 **Deadlines:** Mid-Term Presentation: 13/11/2026 | Final Report, Code, Poster & Defense: 11/12/2026
+
+> **Revision 2026-11-05:** corrected the dataset size, the V-JEPA 2.1 checkpoint resolution (§4), the $640 \times 360$ preprocessing description (§4.1), the feature-bank storage estimate and predictor caching (§4.3), the leakage-rule conflict of Option B and the gate-interpretability claim (§5.3), the submission format (§6.2), and Week 1 tasks that already exist in the repository (§7). Choices that still need a team decision are marked **Decision needed**.
 
 ## 1. Grading Strategy & Core Research Thesis
 
@@ -78,13 +80,21 @@ We combine and extend three 2026 state-of-the-art paradigms on EPIC-KITCHENS-100
 
 ## 4. Feature Extraction & Temporal Alignment on VSC
 
-Decoding 17 GB of compressed H.264 video on every training epoch will bottleneck VSC GPUs on CPU/disk I/O. We extract features once using a frozen V-JEPA 2.1 ViT-L/256 (or ViT-G/384 if VSC quota allows) backbone ([github.com/facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2)) and save compact fp16 tensors.
+Decoding ≈49 GiB of compressed H.264 video on every training epoch will bottleneck VSC GPUs on CPU/disk I/O. We extract features once using a frozen V-JEPA backbone ([github.com/facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2)) and save compact fp16 tensors.
+
+V-JEPA 2.1 publishes only 384-px checkpoints (ViT-B and ViT-L distilled from ViT-G, plus ViT-g and ViT-G); 256-px checkpoints exist only for V-JEPA 2 (ViT-L, ViT-H, ViT-g). The 256-px budget setting below therefore uses V-JEPA 2 ViT-L/256. The stronger options are V-JEPA 2.1 ViT-L/384 and, if VSC quota allows, V-JEPA 2.1 ViT-G/384. **Decision needed:** backbone and resolution, before the first extraction.
 
 ### 4.1 Spatial Preprocessing ($640 \times 360 \rightarrow 256 \times 256$)
 
 * **Problem:** Standard center-cropping of a $16:9$ ($640 \times 360$) egocentric frame to $1:1$ cuts off the left, right, and bottom margins where hands manipulate objects.
 
-* **Solution:** Resize the frame to $284 \times 256$ (preserving most of the horizontal field of view with minimal aspect ratio shift) and take a bottom-centered $256 \times 256$ crop, since hands in head-mounted cameras almost always enter from the bottom half of the frame. Document this choice in the paper.
+* **Correction:** Resizing to $284 \times 256$ is not a small aspect-ratio change: 16:9 (≈1.78) becomes ≈1.11, a 38% horizontal squeeze. A $256 \times 256$ crop of a 256-px-high frame can only trim the sides, so it cannot be bottom-centred. The real options are:
+
+  * (a) resize the short side to 256 ($455 \times 256$) and crop $256 \times 256$, keeping 56% of the width;
+  * (b) resize the whole frame to $256 \times 256$, keeping the full field of view with a 1.78× horizontal squeeze;
+  * (c) the official vjepa2 EK-100 evaluation transform for the chosen checkpoint.
+
+  Use (c) for the baseline, report (a) vs. (b) as an ablation, and document the choice in the paper.
 
 ### 4.2 Exact Temporal Alignment (Preventing Leakage & Context Loss)
 
@@ -101,7 +111,7 @@ Decoding 17 GB of compressed H.264 video on every training epoch will bottleneck
 
   * Notice that the final step $k = S$ ends exactly at $\tau_S^{(i)} = t_{\text{obs}}^{(i)}$.
 
-  * To save compute on dense videos, extract a dense $0.25\text{s}$-strided feature bank across each untrimmed video (each clip covering a $2.0\text{s}$ window $[t - 2.0\text{s}, t]$ of 16 frames at 8 fps), **PLUS** an exact clip ending at $t_{\text{obs}}^{(i)}$ for the final step $k=S$. For earlier memory steps $k < S$, snap $\tau_k^{(i)}$ down to the nearest $0.25\text{s}$ bank entry $\le \tau_k^{(i)}$. This guarantees zero future leakage, exact alignment at $t_{\text{obs}}^{(i)}$, and fast extraction.
+  * To save compute on dense videos, extract a dense strided feature bank across each untrimmed video (stride $0.25$–$1.0\text{s}$; see the cost note in §4.3) (each clip covering a $2.0\text{s}$ window $[t - 2.0\text{s}, t]$ of 16 frames at 8 fps), **PLUS** an exact clip ending at $t_{\text{obs}}^{(i)}$ for the final step $k=S$. For earlier memory steps $k < S$, snap $\tau_k^{(i)}$ down to the nearest bank entry $\le \tau_k^{(i)}$. This guarantees zero future leakage, exact alignment at $t_{\text{obs}}^{(i)}$, and fast extraction.
 
 * **Segment-Aligned AR Extraction:**
 
@@ -109,7 +119,7 @@ Decoding 17 GB of compressed H.264 video on every training epoch will bottleneck
 
 ### 4.3 Compact Token Storage Format (Solving the Pooling vs. Probe Dilemma)
 
-For a 16-frame clip at $256 \times 256$, V-JEPA 2.1 outputs $T' \times H' \times W' = 8 \times 16 \times 16 = 2048$ tokens of dimension $D = 1024$. Saving all 2048 tokens takes too much disk space, but saving a single mean-pooled vector ($1 \times D$) breaks the JFAA Attentive Probe.
+For a 16-frame clip at $256 \times 256$ (V-JEPA 2 ViT-L/256), the encoder outputs $T' \times H' \times W' = 8 \times 16 \times 16 = 2048$ tokens of dimension $D = 1024$; at $384 \times 384$ (V-JEPA 2.1 ViT-L/384) it outputs $8 \times 24 \times 24 = 4608$ tokens. Saving all 2048 tokens takes too much disk space, but saving a single mean-pooled vector ($1 \times D$) breaks the JFAA Attentive Probe.
 
 #### Our Compact Token Representation ($24 \times D$ per clip in fp16):
 
@@ -117,7 +127,9 @@ For a 16-frame clip at $256 \times 256$, V-JEPA 2.1 outputs $T' \times H' \times
 
 2. **Active Spatial Grid (**$E_{\text{spat}} \in \mathbb{R}^{16 \times D}$**):** $4 \times 4$ adaptive spatial average pool over the last 2 temporal slices (the final $0.5\text{s}$ of the clip). Preserves spatial layout of hands and countertop objects for Noun recognition/anticipation.
 
-* **Disk Footprint:** $24 \times 1024 \times 2\text{ bytes} \approx 49\text{ KB}$ per clip $\rightarrow$ \~18 GB total on VSC scratch storage, loading into RAM in seconds!
+* **Disk Footprint:** $24 \times 1024 \times 2\text{ bytes} \approx 49\text{ KB}$ per clip. EK-100 has ≈100 h of video (≈360,000 s), so a $0.25\text{s}$ bank is ≈1.44 M clips ≈ 70 GB, plus the per-event AR/STA clips; a $0.5\text{s}$ bank is ≈35 GB and a $1.0\text{s}$ bank ≈18 GB. The number of clips is also the number of backbone forward passes, which dominates extraction time. **Decision needed:** a $0.5\text{s}$ stride keeps the snapping error of the $1.0\text{s}$-spaced memory steps at $\le 0.5\text{s}$ for half the cost. Store the bank as per-video shards and load them on demand instead of holding it all in RAM.
+
+* **Cache the predictor output in the same pass:** Module 3 Option A runs the frozen V-JEPA predictor on the *full* encoder token sequence plus mask tokens, so it cannot be run later from the 24 compressed tokens. Run the predictor during extraction for every per-event STA clip and store its future tokens in the same compressed format; otherwise all STA features must be re-extracted in Week 5.
 
 ## 5. Model Architecture (AR & STA)
 
@@ -182,7 +194,7 @@ To bridge the $1.0\text{s}$ anticipation gap $[t_{\text{obs}}, t_s]$, we compare
 
 * **Option A (Frozen V-JEPA 2.1 Predictor, as in JFAA arXiv:2605.20904):** Feed the observed clip tokens at $t_{\text{obs}}$ into the frozen V-JEPA 2.1 predictor with future mask tokens to obtain predicted tokens $\hat{Z}_{t+1}$, then apply the Factorized Attentive Probe to get $(f_t^v, f_t^n)$.
 
-* **Option B (Learned Causal Latent Bridge — Safe Fallback & Ablation):** A lightweight 2-layer causal Transformer trained to regress the stop-gradient V-JEPA encoding of the target action segment $e_{\text{AR}}$ from the observed sequence $e_{t-S:t}$ using a cosine similarity loss during training (requiring zero future frames at inference).
+* **Option B (Learned Causal Latent Bridge — Ablation, pending a rule check):** A lightweight 2-layer causal Transformer trained to regress the stop-gradient V-JEPA encoding of the target action segment $e_{\text{AR}}$ from the observed sequence $e_{t-S:t}$ using a cosine similarity loss during training (requiring zero future frames at inference). **Rule check needed:** §2.2 also forbids reading frames from $(t_s - 1.0\text{s}, t_e]$ during training, and Option B uses the encoding of exactly those target-action frames as its training target. Confirm with the teaching team that this is allowed before building it; if it is not, keep Option A only.
 
 #### Scale-Normalized 3-Way Gate (Crucial for Interpretability):
 
@@ -202,7 +214,7 @@ $$
 o_t^c = g_1^c \tilde{h}_t^c + g_2^c \tilde{e}_t^c + g_3^c \tilde{f}_t^c, \quad c \in \{v, n\}
 $$
 
-Because $\Vert{}\tilde{h}_t^c\Vert{}_2 \approx \Vert{}\tilde{e}_t^c\Vert{}_2 \approx \Vert{}\tilde{f}_t^c\Vert{}_2$, the scalars $(g_1^c, g_2^c, g_3^c)$ are strictly interpretable importance weights that we can plot per verb and noun class in our final report and poster.
+Because $\Vert{}\tilde{h}_t^c\Vert{}_2 \approx \Vert{}\tilde{e}_t^c\Vert{}_2 \approx \Vert{}\tilde{f}_t^c\Vert{}_2$, the scalars $(g_1^c, g_2^c, g_3^c)$ are comparable across branches, and we can plot them per verb and noun class in our final report and poster as an approximate indication of each branch's contribution. They are not a causal importance measure, so pair the plots with branch-removal ablations.
 
 ## 6. Loss Functions, Metric Calibration & Cold-Start Priors
 
@@ -224,7 +236,7 @@ $$
 
 * **For Task 2 (STA):** Primary metric is Action MT5R (mean per-class Top-5 recall). Unadjusted models predict common head classes on every clip, giving $0\%$ recall on rare classes. Grid-search $(\tau_v^{\text{STA}}, \tau_n^{\text{STA}}) \in [0.4, 1.2]$ on the validation set to directly maximize Action MT5R.
 
-* **Note on Codabench Submission Format:** Always verify whether the Codabench evaluation script applies softmax internally or expects log-probabilities/probabilities, and submit $z^{\text{cal}}$ (or $\text{softmax}(z^{\text{cal}})$) accordingly.
+* **Submission format:** The course defines `verb_output` and `noun_output` as predicted class probabilities, so submit $\text{softmax}(z^{\text{cal}})$ for each, not raw logits. `epic_metrics.save_submission()` checks IDs, shapes and finite values, but not that each row sums to 1.
 
 ### 6.3 Solving the $<1.0\text{s}$ Cold-Start Edge Case
 
@@ -242,11 +254,11 @@ For hidden-test events with $t_s < 1.0\text{s}$ (`sta_observation_end_seconds < 
 
 1. **Week 1 (Oct 23 – Oct 30):**
 
-   * Run dataset inspection script on `train.csv` and freeze the Hybrid Seen + Unseen Validation Split.
+   * Run dataset inspection script on `train.csv`, implement the Hybrid Seen + Unseen Validation Split in `epic_starter/data/manifests.py` (it replaces the current video-grouped split there), and freeze it.
 
-   * Write automated unit test checking that zero STA clips ever read frames after `sta_observation_end_seconds`.
+   * Extend the existing leakage checks to the feature-extraction path. `tests/test_epic.py::test_sta_never_samples_gap_or_target` and `validate_batch()` in `scripts/check_data.py` already verify that the data loader never returns STA frames after `sta_observation_end_seconds`.
 
-   * Run V-JEPA 2.1 ViT-L/256 feature extraction on VSC ($24 \times D$ compact token format) for AR and STA.
+   * Run ViT-L feature extraction on VSC ($24 \times D$ compact token format) for AR and STA, including the predictor's future tokens (§4.3); see §4 for the backbone and resolution decision.
 
 2. **Week 2 (Oct 31 – Nov 6):**
 
@@ -268,7 +280,7 @@ For hidden-test events with $t_s < 1.0\text{s}$ (`sta_observation_end_seconds < 
 
 1. **Week 4 (Nov 14 – Nov 20):** Implement single-stream AGA (arXiv:2603.01743) vs. Decoupled Verb-AGA & Noun-AGA.
 
-2. **Week 5 (Nov 21 – Nov 27):** Add LayerNorm-Calibrated 3-Way Gate and test Frozen V-JEPA Predictor ($f_t$) vs. Learned Causal Predictor ($f_t$) ($\text{AR} \rightarrow \text{STA}$ latent regression).
+2. **Week 5 (Nov 21 – Nov 27):** Add LayerNorm-Calibrated 3-Way Gate and test Frozen V-JEPA Predictor ($f_t$) vs. Learned Causal Predictor ($f_t$) ($\text{AR} \rightarrow \text{STA}$ latent regression; only if the rule check in §5.3 allows it).
 
 3. **Week 6–7 (Nov 28 – Dec 11):** Generate gate interpretability plots, finalize clean GitHub repository documentation (25% grade), write conference-format paper (20% grade), design PDF poster (10% grade), and rehearse final defense (30% grade).
 
@@ -278,10 +290,10 @@ Because individual grades can be adjusted during the defense based on individual
 
 | Team Member | Primary Ownership | Pre-Mid-Term Deliverables (by 13/11) | Post-Mid-Term Deliverables (by 11/12) | Defense & Paper Section | 
 | ----- | ----- | ----- | ----- | ----- | 
-| **Member 1**   *(Data, Calibration & Evaluation)* | Hybrid Split, Leakage Tests, Logit Adjustment & Cold-Start Priors | Builds Seen/Unseen/Tail split; writes leakage unit test; implements $<1.0\text{s}$ prior + $(\tau_v, \tau_n)$ calibration; manages Codabench submissions. | Tunes dynamic Markov action transition priors $P(v_t, n_t \mid \hat{v}_{t-1}, \hat{n}_{t-1})$; runs full Seen/Unseen/Tail breakdown tables. | Section 3 (Splits & Metrics) & Section 5.3 (Long-Tail Calibration Analysis). | 
+| **Member 1**   *(Data, Calibration & Evaluation)* | Hybrid Split, Leakage Tests, Logit Adjustment & Cold-Start Priors | Builds Seen/Unseen/Tail split; extends the existing leakage tests to feature extraction; implements $<1.0\text{s}$ prior + $(\tau_v, \tau_n)$ calibration; manages Codabench submissions. | Tunes dynamic Markov action transition priors $P(v_t, n_t \mid \hat{v}_{t-1}, \hat{n}_{t-1})$; runs full Seen/Unseen/Tail breakdown tables. | Section 3 (Splits & Metrics) & Section 5.3 (Long-Tail Calibration Analysis). | 
 | **Member 2**   *(VSC Backbone & Factorized Probing — You)* | VSC Feature Extraction & Factorized Spatiotemporal Attentive Probe (AR + STA) | Extracts V-JEPA 2.1 $24\times D$ token bank on VSC; builds AR & STA Factorized Verb/Noun Attentive Probe baseline. | Ablates Global Pool vs. Hand-Crafted Motion Saliency vs. Learned Factorized Verb/Noun Queries on Unseen Participants. | Section 4.1 (Representations & AR/STA Probing) + Spatial Attention Visualizations. | 
 | **Member 3**   *(Temporal Memory / AGA)* | Action-Guided Attention (AGA) & Decoupled Verb/Noun Memory | Sets up sequential dataset loader ($S=16$ steps anchored at $t_{\text{obs}}$) and reproduces single-stream AGA baseline. | Implements Decoupled Verb-AGA & Noun-AGA streams; ablates history horizon $S \in \{4, 8, 16, 30\}$. | Section 4.2 (Decoupled Action-Guided Memory) + Horizon Ablations. | 
-| **Member 4**   *(Future Prediction & 3-Way Gating)* | Future Latent Estimation ($f_t$) & Normalized 3-Way Gating | Extracts/tests V-JEPA 2.1 predictor tokens $f_t$ (arXiv:2605.20904) with linear/attentive probe to verify predictive signal. | Implements Learned Causal Bridge ($e_{t-S:t} \rightarrow e_{\text{AR}}$) + LayerNorm 3-Way Gate; plots gate weights $(g_1, g_2, g_3)$ across verbs vs. nouns. | Section 4.3 (Future Latent Bridging & Gate Interpretability Figures). | 
+| **Member 4**   *(Future Prediction & 3-Way Gating)* | Future Latent Estimation ($f_t$) & Normalized 3-Way Gating | Extracts/tests V-JEPA 2.1 predictor tokens $f_t$ (arXiv:2605.20904) with linear/attentive probe to verify predictive signal. | Implements Learned Causal Bridge ($e_{t-S:t} \rightarrow e_{\text{AR}}$, subject to the rule check in §5.3) + LayerNorm 3-Way Gate; plots gate weights $(g_1, g_2, g_3)$ across verbs vs. nouns. | Section 4.3 (Future Latent Bridging & Gate Interpretability Figures). | 
 
 ## 9. Verified References
 
