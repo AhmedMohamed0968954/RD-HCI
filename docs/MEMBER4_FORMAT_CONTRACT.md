@@ -28,13 +28,12 @@ not raw encoder token sizes.
 
 ## Backbone and preprocessing
 
-Selected production backbone and diagnostic reference:
-- Diagnostic reference only: V-JEPA 2 ViT-L/256: vitl.pt, configs/eval/vitl/ek100.yaml.
+Selected production backbone:
 - Selected: V-JEPA 2.1 distilled ViT-L/384: vjepa2_1_vitl_dist_vitG_384.pt,
   configs/eval_2_1/vitl-384/ek100.yaml.
 
 The first bank must use the selected 2.1 checkpoint at 384 x 384.
-The 256 model is only a compatible-space predictor diagnostic, not the production bank.
+Do not run or extract the V-JEPA 2/256 model. The owner explicitly excluded it.
 Never mix the two candidates in one bank or label a 384 checkpoint as 256.
 
 The CPU feasibility run explicitly uses 16 frames at 8 fps (2 seconds), matching

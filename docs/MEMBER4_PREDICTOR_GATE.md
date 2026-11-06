@@ -68,3 +68,12 @@ The job clones vjepa2 into `team/code/vjepa2`, downloads the checkpoints into
 - Timings are CPU numbers; GPU timings come with the first training job.
 - Next: connect `f_t` from cached predictor tokens (blueprint §4.3) and `e_t` from Member 2's probe
   to `GatedVerbNounHead`, then add `h_t` from Member 3's memory.
+
+
+## Selected execution scope (2026-11-06)
+
+The owner selected only V-JEPA 2.1 distilled ViT-L/384, at 16 frames and 8 fps.
+Earlier references to running two backbones are superseded. No V-JEPA 2/256
+run is requested. Direct predictor-versus-student-encoder fidelity remains
+unvalidated; the selected run measures execution, wrapper equivalence,
+finite outputs and cross-event feature variation, followed by the gate demo.

@@ -84,8 +84,8 @@ Decoding ≈49 GiB of compressed H.264 video on every training epoch will bottle
 
 **Selected 2026-11-06:** V-JEPA 2.1 distilled ViT-L/384, checkpoint
 `vjepa2_1_vitl_dist_vitG_384.pt`. The input is 384 x 384, 16 frames at 8 fps
-(2 seconds). V-JEPA 2 ViT-L/256 is retained only as a predictor-fidelity
-reference; it is not the production feature-bank backbone.
+(2 seconds). Do not run the V-JEPA 2/256 alternative. Predictor fidelity against
+student encoder targets is not established for this distilled checkpoint.
 
 ### 4.1 Spatial Preprocessing (640 x 360 to 384 x 384)
 

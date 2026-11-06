@@ -9,7 +9,7 @@
 #SBATCH --time=01:30:00
 #SBATCH --export=NONE
 
-# Member 4: tests, then the predictor feasibility check on CPU for two backbones.
+# Member 4: tests, then the predictor feasibility check on CPU for the selected V-JEPA 2.1 ViT-L/384 backbone.
 # Submit from the repository root with your own account and log path:
 #   sbatch -M wice -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/m4-feasibility-%j.out" scripts/member4_feasibility.slurm
 # The vjepa2 clone and the pretrained checkpoints (about 5 GB each) go to the shared team folder,
@@ -54,7 +54,6 @@ fetch() {  # download once, verify the size, rename only when complete
     mv "$CKPT/$name.part" "$CKPT/$name"
 }
 fetch vjepa2_1_vitl_dist_vitG_384.pt
-fetch vitl.pt
 
 STAMP="$(date +%Y%m%d-%H%M%S)-${SLURM_JOB_ID}"
 FAILED=0
@@ -65,7 +64,6 @@ run() {  # run <tag> <config relative to the vjepa2 clone> <checkpoint>
         || { echo "FAILED: $1 (see $OUT/feasibility_${1}_${STAMP}.log)"; tail -20 "$OUT/feasibility_${1}_${STAMP}.log"; FAILED=1; }
 }
 run vjepa21_vitl384 configs/eval_2_1/vitl-384/ek100.yaml vjepa2_1_vitl_dist_vitG_384.pt
-run vjepa2_vitl256 configs/eval/vitl/ek100.yaml vitl.pt
 python scripts/gate_demo.py --steps 300 > "$OUT/gate_demo_${STAMP}.txt"
 ls -la "$OUT"
 if [[ "$FAILED" != 0 ]]; then
