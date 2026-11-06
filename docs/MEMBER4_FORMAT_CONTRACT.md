@@ -1,6 +1,7 @@
 # Member 4 integration contract proposal
 
-This records the handoff proposal, not a claim that other members have approved it.
+Backbone decision: the project owner selected V-JEPA 2.1 ViT-L/384 on 2026-11-06.
+The timestamp-column and 1.0-second bank proposals still need adoption by the other members.
 
 ## Event timestamps
 
@@ -27,13 +28,13 @@ not raw encoder token sizes.
 
 ## Backbone and preprocessing
 
-The current comparison includes two distinct candidates:
-- V-JEPA 2 ViT-L/256: vitl.pt, configs/eval/vitl/ek100.yaml.
-- V-JEPA 2.1 distilled ViT-L/384: vjepa2_1_vitl_dist_vitG_384.pt,
+Selected production backbone and diagnostic reference:
+- Diagnostic reference only: V-JEPA 2 ViT-L/256: vitl.pt, configs/eval/vitl/ek100.yaml.
+- Selected: V-JEPA 2.1 distilled ViT-L/384: vjepa2_1_vitl_dist_vitG_384.pt,
   configs/eval_2_1/vitl-384/ek100.yaml.
 
-Do not interpret a vitl384 example directory as a final team choice.
-The first bank should use the agreed candidate after the feasibility report.
+The first bank must use the selected 2.1 checkpoint at 384 x 384.
+The 256 model is only a compatible-space predictor diagnostic, not the production bank.
 Never mix the two candidates in one bank or label a 384 checkpoint as 256.
 
 The CPU feasibility run explicitly uses 16 frames at 8 fps (2 seconds), matching

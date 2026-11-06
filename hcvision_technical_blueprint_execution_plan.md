@@ -82,19 +82,21 @@ We combine and extend three 2026 state-of-the-art paradigms on EPIC-KITCHENS-100
 
 Decoding ≈49 GiB of compressed H.264 video on every training epoch will bottleneck VSC GPUs on CPU/disk I/O. We extract features once using a frozen V-JEPA backbone ([github.com/facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2)) and save compact fp16 tensors.
 
-V-JEPA 2.1 publishes only 384-px checkpoints (ViT-B and ViT-L distilled from ViT-G, plus ViT-g and ViT-G); 256-px checkpoints exist only for V-JEPA 2 (ViT-L, ViT-H, ViT-g). The 256-px budget setting below therefore uses V-JEPA 2 ViT-L/256. The stronger options are V-JEPA 2.1 ViT-L/384 and, if VSC quota allows, V-JEPA 2.1 ViT-G/384. **Decision needed:** backbone and resolution, before the first extraction.
+**Selected 2026-11-06:** V-JEPA 2.1 distilled ViT-L/384, checkpoint
+`vjepa2_1_vitl_dist_vitG_384.pt`. The input is 384 x 384, 16 frames at 8 fps
+(2 seconds). V-JEPA 2 ViT-L/256 is retained only as a predictor-fidelity
+reference; it is not the production feature-bank backbone.
 
-### 4.1 Spatial Preprocessing ($640 \times 360 \rightarrow 256 \times 256$)
+### 4.1 Spatial Preprocessing (640 x 360 to 384 x 384)
 
-* **Problem:** Standard center-cropping of a $16:9$ ($640 \times 360$) egocentric frame to $1:1$ cuts off the left, right, and bottom margins where hands manipulate objects.
-
-* **Correction:** Resizing to $284 \times 256$ is not a small aspect-ratio change: 16:9 (≈1.78) becomes ≈1.11, a 38% horizontal squeeze. A $256 \times 256$ crop of a 256-px-high frame can only trim the sides, so it cannot be bottom-centred. The real options are:
-
-  * (a) resize the short side to 256 ($455 \times 256$) and crop $256 \times 256$, keeping 56% of the width;
-  * (b) resize the whole frame to $256 \times 256$, keeping the full field of view with a 1.78× horizontal squeeze;
-  * (c) the official vjepa2 EK-100 evaluation transform for the chosen checkpoint.
-
-  Use (c) for the baseline, report (a) vs. (b) as an ablation, and document the choice in the paper.
+Use the selected model's official evaluation transform for the extraction baseline.
+Resizing the short edge to 384 gives approximately 683 x 384, then a 384 x 384
+center crop retains about 56% of the width. Alternatively, full-frame resizing
+to a square preserves the field of view but distorts the aspect ratio.
+The current Member 4 feasibility script uses that full-frame resize with ImageNet
+normalization. Its timing/fidelity measurements describe this diagnostic transform,
+not an official evaluation result. Feature-bank meta.json must identify the exact
+resize/crop and normalization used; do not mix caches from different transforms.
 
 ### 4.2 Exact Temporal Alignment (Preventing Leakage & Context Loss)
 
