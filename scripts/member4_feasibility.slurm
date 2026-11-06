@@ -61,7 +61,7 @@ FAILED=0
 run() {  # run <tag> <config relative to the vjepa2 clone> <checkpoint>
     python scripts/predictor_feasibility.py --backend vjepa --vjepa-root "$VJEPA" \
         --config "$VJEPA/$2" --checkpoint "$CKPT/$3" --csv "$ANNOTATIONS" --video-root "$VIDEOS" \
-        --num-events 8 --out "$OUT/feasibility_${1}_${STAMP}.json" > "$OUT/feasibility_${1}_${STAMP}.log" 2>&1 \
+        --frames 16 --fps 8 --device cpu --num-events 8 --out "$OUT/feasibility_${1}_${STAMP}.json" > "$OUT/feasibility_${1}_${STAMP}.log" 2>&1 \
         || { echo "FAILED: $1 (see $OUT/feasibility_${1}_${STAMP}.log)"; tail -20 "$OUT/feasibility_${1}_${STAMP}.log"; FAILED=1; }
 }
 run vjepa21_vitl384 configs/eval_2_1/vitl-384/ek100.yaml vjepa2_1_vitl_dist_vitG_384.pt

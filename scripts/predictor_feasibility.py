@@ -206,6 +206,8 @@ def run_feasibility(args):
                          else "outputs differ across events") + ("" if finite else "; NON-FINITE values found"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if not finite or not report["checks"]["matches_official_wrapper"]:
+        raise RuntimeError(f"Predictor validation failed; see {out}")
     return report
 
 
