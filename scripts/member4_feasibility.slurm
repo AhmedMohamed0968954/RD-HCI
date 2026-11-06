@@ -41,28 +41,35 @@ fi
 
 python -m pytest tests -q -p no:cacheprovider
 
+mkdir -p "$TEAM/code"
 [ -d "$VJEPA/.git" ] || git clone --depth 1 https://github.com/facebookresearch/vjepa2.git "$VJEPA"
 mkdir -p "$CKPT" "$OUT"
 fetch() {  # download once, verify the size, rename only when complete
     local name=$1 url="https://dl.fbaipublicfiles.com/vjepa2/$1" expected
-    expected=$(curl -sIL "$url" | awk 'tolower($1)=="content-length:" {v=$2} END {print v+0}')
+    expected=$(curl -fsIL "$url" | awk 'tolower($1)=="content-length:" {v=$2} END {print v+0}')
     if [[ -s "$CKPT/$name" && $(stat -c %s "$CKPT/$name") == "$expected" ]]; then return 0; fi
-    curl -sfL "$url" -o "$CKPT/$name.part"
+    [[ "$expected" -gt 0 ]] || { echo "Missing size for $name"; exit 1; }
+    curl --retry 3 --connect-timeout 30 -sfL "$url" -o "$CKPT/$name.part"
     [[ $(stat -c %s "$CKPT/$name.part") == "$expected" ]] || { echo "size mismatch for $name"; exit 1; }
     mv "$CKPT/$name.part" "$CKPT/$name"
 }
 fetch vjepa2_1_vitl_dist_vitG_384.pt
 fetch vitl.pt
 
-STAMP=$(date +%Y%m%d-%H%M%S)
+STAMP="$(date +%Y%m%d-%H%M%S)-${SLURM_JOB_ID}"
+FAILED=0
 run() {  # run <tag> <config relative to the vjepa2 clone> <checkpoint>
     python scripts/predictor_feasibility.py --backend vjepa --vjepa-root "$VJEPA" \
         --config "$VJEPA/$2" --checkpoint "$CKPT/$3" --csv "$ANNOTATIONS" --video-root "$VIDEOS" \
         --num-events 8 --out "$OUT/feasibility_${1}_${STAMP}.json" > "$OUT/feasibility_${1}_${STAMP}.log" 2>&1 \
-        || { echo "FAILED: $1 (see $OUT/feasibility_${1}_${STAMP}.log)"; tail -20 "$OUT/feasibility_${1}_${STAMP}.log"; }
+        || { echo "FAILED: $1 (see $OUT/feasibility_${1}_${STAMP}.log)"; tail -20 "$OUT/feasibility_${1}_${STAMP}.log"; FAILED=1; }
 }
 run vjepa21_vitl384 configs/eval_2_1/vitl-384/ek100.yaml vjepa2_1_vitl_dist_vitG_384.pt
 run vjepa2_vitl256 configs/eval/vitl/ek100.yaml vitl.pt
 python scripts/gate_demo.py --steps 300 > "$OUT/gate_demo_${STAMP}.txt"
 ls -la "$OUT"
+if [[ "$FAILED" != 0 ]]; then
+    echo "MEMBER4_FEASIBILITY_FAILED: inspect model logs"
+    exit 1
+fi
 echo "MEMBER4_FEASIBILITY_DONE"

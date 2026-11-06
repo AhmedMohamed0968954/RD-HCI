@@ -26,7 +26,8 @@ def project(tmp_path):
         stream.pix_fmt = "yuv420p"
         for i in range(120):
             pixels = np.zeros((32, 32, 3), dtype=np.uint8)
-            pixels[:, :, i % 3] = 20 + 2 * i
+            # Keep all 120 changing frames within uint8 without overflow or wrapping.
+            pixels[:, :, i % 3] = 20 + i
             frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
             frame.pts, frame.time_base = i, Fraction(1, 10)
             for packet in stream.encode(frame):
