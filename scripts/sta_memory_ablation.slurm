@@ -9,7 +9,7 @@
 #SBATCH --array=0-10%3
 
 # Member 3 ablation (all on top of Member 2's STA factorized probe as the present encoder,
-# initialised from its checkpoint, so every row is "probe + memory"):
+# initialised from its checkpoint and frozen, so every row is "fixed probe + memory"):
 #   0-3  single memory,    S = 4, 8, 16, 30 s
 #   4-7  decoupled memory, S = 4, 8, 16, 30 s
 #   8    decoupled S=16 with the memory's token mean as present (shows what the probe adds)
