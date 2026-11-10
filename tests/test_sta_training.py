@@ -169,6 +169,13 @@ def test_present_probe_initialisation_and_freezing(toy, tmp_path):
     cfg = json.loads((out_dir / "config.json").read_text())
     assert cfg["present_init"]["val_action_mt5r"] == 7.63
     assert cfg["trainable_parameters"] < cfg["parameters"]
+    # the pre-training score is the probe alone and becomes the report's baseline row
+    init = json.loads((out_dir / "metrics.json").read_text())["init"]
+    assert init["probe_alone"] and 0 <= init["val"]["all"]["action_mt5r"] <= 100
+    script("report_sta_memory").main(["--runs-dir", str(toy / "runs"), "--out-dir", str(tmp_path / "rep")])
+    table = (tmp_path / "rep" / "results.md").read_text()
+    assert table.count("probe alone (before training)") == 1
+    assert f"{init['val']['all']['action_mt5r']:.2f}" in table.splitlines()[2]
 
 
 def test_mean_present_ablation_runs(toy):

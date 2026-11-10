@@ -4,7 +4,9 @@
 
 Writes to --out-dir:
   results.csv / results.md   one row per run: mode, S, seed, best epoch, Overall / Unseen / Tail scores
-                             (Unseen / Tail from Member 1's official breakdown when available)
+                             (Unseen / Tail from Member 1's official breakdown when available), plus a
+                             'probe alone' row: runs initialised from Member 2's probe are scored
+                             before training, when the memory correction is still exactly zero
   horizon.png                validation Action MT5R vs history length S, single vs decoupled (mean ± std over seeds)
   <run>_attention.png        where the memory looks: mean attention per second before the cutoff
   <run>_gates.png            how much each stream relies on history vs the present (gate values)
@@ -30,18 +32,42 @@ def load_runs(root: Path):
             continue
         a = cfg["args"]
         row = {"run": run.name, "mode": a["mode"], "steps": a["steps"], "seed": a["seed"],
-               "fusion": a.get("fusion", "aga"), "present": a.get("present_encoder", "mean"),
+               "fusion": a.get("fusion", "aga"),
+               "present": a.get("present_encoder", "mean") + (" (frozen)" if a.get("freeze_present") else
+                          " (trainable)" if a.get("present_encoder") == "probe" else ""),
                "anchor": not a.get("no_anchor", False), "best_epoch": m["best_epoch"]}
-        bd = m.get("best_val_breakdown") or {}
-        row["official_unseen_action_mt5r"] = (bd.get("unseen") or {}).get("action_mt5r")
-        row["official_tail_action_mt5r"] = (bd.get("tail") or {}).get("action_mt5r")
-        for subset, res in m["best_val"].items():
-            prefix = {"all": "", "unseen": "unseen_", "tail": "tail_",
-                      "unseen_participants": "unseen_", "tail_actions": "tail_"}.get(subset, subset + "_")
-            for key in ("action_mt5r", "verb_mt5r", "noun_mt5r", "action_top1"):
-                row[prefix + key] = res.get(key)
+        row.update(scores(m["best_val"], m.get("best_val_breakdown")))
+        init = m.get("init") or {}
+        if init.get("probe_alone"):               # score before training = Member 2's probe alone
+            row["init"] = scores(init["val"], init.get("breakdown"))
         runs.append((row, run))
     return runs
+
+
+def scores(res, breakdown):
+    """Flatten one evaluation (all / unseen / tail subsets + Member 1's breakdown) into row keys."""
+    row = {}
+    for subset, r in (res or {}).items():
+        prefix = {"all": "", "unseen": "unseen_", "tail": "tail_",
+                  "unseen_participants": "unseen_", "tail_actions": "tail_"}.get(subset, subset + "_")
+        for key in ("action_mt5r", "verb_mt5r", "noun_mt5r", "action_top1"):
+            row[prefix + key] = r.get(key)
+    bd = breakdown or {}
+    row["official_unseen_action_mt5r"] = (bd.get("unseen") or {}).get("action_mt5r")
+    row["official_tail_action_mt5r"] = (bd.get("tail") or {}).get("action_mt5r")
+    return row
+
+
+def baselines(rows):
+    """One 'probe alone' row per present-clip setting (exact STA clip / bank fallback), taken from the
+    pre-training evaluation of runs initialised from Member 2's probe (identical for all of them)."""
+    found = {}
+    for r in rows:
+        if "init" in r and r["anchor"] not in found:
+            found[r["anchor"]] = {"run": r["run"] + "@init", "mode": "none", "present": "probe alone",
+                                  "fusion": "–", "steps": 0, "seed": r["seed"], "anchor": r["anchor"],
+                                  "best_epoch": None, **r["init"]}
+    return [found[k] for k in sorted(found, reverse=True)]
 
 
 def prefer_official(row, key):
@@ -58,12 +84,17 @@ def write_tables(rows, out: Path):
     cols = ["run", "mode", "present", "fusion", "steps", "seed", "anchor", "best_epoch", "action_mt5r", "verb_mt5r", "noun_mt5r",
             "unseen_action_mt5r", "tail_action_mt5r", "official_unseen_action_mt5r",
             "official_tail_action_mt5r", "action_top1"]
+    base = baselines(rows)
     with (out / "results.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
-        w.writerows(rows)
+        w.writerows(base + rows)
     lines = ["| Memory | Present | Fusion | S | Seed | Action MT5R | Verb MT5R | Noun MT5R | Unseen action | Tail action |",
              "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in base:
+        lines.append(f"| none{'' if r['anchor'] else ' (no anchor)'} | probe alone (before training) | – | – | – | "
+                     f"{fmt(r.get('action_mt5r'))} | {fmt(r.get('verb_mt5r'))} | {fmt(r.get('noun_mt5r'))} | "
+                     f"{fmt(prefer_official(r, 'unseen_action_mt5r'))} | {fmt(prefer_official(r, 'tail_action_mt5r'))} |")
     for r in sorted(rows, key=lambda r: (r["mode"], r["present"], r["fusion"], r["steps"], r["seed"])):
         lines.append(f"| {r['mode']}{'' if r['anchor'] else ' (no anchor)'} | {r['present']} | {r['fusion']} | "
                      f"{r['steps']} | {r['seed']} | "
@@ -74,8 +105,12 @@ def write_tables(rows, out: Path):
 
 def plot_horizon(rows, out: Path, plt):
     groups = defaultdict(lambda: defaultdict(list))
-    for r in rows:
-        if r["anchor"] and r["fusion"] == "aga" and r["present"] == "probe" and r.get("action_mt5r") is not None:
+    base = [r for r in rows if r["anchor"] and r["fusion"] == "aga" and r.get("action_mt5r") is not None]
+    presents = [r["present"] for r in base]
+    # one present setting per plot: the frozen probe (main ablation) when present, else the most common
+    chosen = "probe (frozen)" if "probe (frozen)" in presents else max(set(presents), key=presents.count, default=None)
+    for r in base:
+        if r["present"] == chosen:
             groups[r["mode"]][r["steps"]].append(r["action_mt5r"])
     if not groups:
         return
@@ -87,6 +122,9 @@ def plot_horizon(rows, out: Path, plt):
         mean = [np.mean(groups[mode][k]) for k in s]
         std = [np.std(groups[mode][k]) for k in s]
         ax.errorbar(s, mean, yerr=std, marker=marker, capsize=3, label=f"{mode} AGA")
+    probe = [b for b in baselines(rows) if b["anchor"] and b.get("action_mt5r") is not None]
+    if probe and chosen.startswith("probe"):
+        ax.axhline(probe[0]["action_mt5r"], color="grey", ls=":", label="probe alone (no memory)")
     ax.set_xlabel("History length S (seconds before the cutoff)")
     ax.set_ylabel("Validation action MT5R (%)")
     ax.set_xticks(sorted({k for g in groups.values() for k in g}))

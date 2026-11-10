@@ -55,7 +55,18 @@ Checks on read: an STA clip ending after the cutoff raises an error; a legacy am
   (`--fusion three_way`; future branch unavailable until predictor features are wired in via
   `GatedAGAModel(..., future=(f_v, f_n))`).
 - With the probe, output = probe logits + memory correction (zero-initialised): with
-  `--present-init` the model starts exactly at Member 2's probe score.
+  `--present-init` the model starts exactly at Member 2's probe score. Every run is scored once
+  before training (`init` in `metrics.json`); for these runs that is the probe alone in this
+  same pipeline, and the report prints it as the baseline row. The Slurm jobs also **freeze**
+  the probe (`--freeze-present`). Decoupled S = 16 on the full data (val action MT5R; probe
+  alone 7.63):
+
+  | probe | best | epochs after the best | early stop |
+  |---|---|---|---|
+  | trainable | 7.86 (epoch 0) | falls to 6.6–7.1 (overfits) | epoch 8 |
+  | frozen | **8.20** (epoch 2) | stays at 7.75–8.04 | epoch 10 |
+
+  `EPIC_TRAIN_PRESENT=1` keeps it trainable.
 - `model.encode(...)` returns `verb_history`, `noun_history`, `verb_present`, `noun_present`
   (`[B, d]`), `history_available`, `present_available` — the inputs of Member 4's gate.
 - Loss: cross-entropy with label smoothing 0.1 (as Member 2) + 0.5 × auxiliary step loss; no

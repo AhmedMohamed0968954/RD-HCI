@@ -320,6 +320,17 @@ def main(argv=None):
               "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)}
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
+    # Score before any training. With --present-init (AGA fusion) the memory correction starts at
+    # zero, so this is exactly Member 2's probe in this pipeline: same split, clips and evaluator.
+    p0 = predict(model, loaders["val"], device, prior_v, prior_n)
+    init = {"val": evaluate(p0["verb_logits"], p0["noun_logits"], p0["verb_label"], p0["noun_label"],
+                            task="STA", subsets=masks),
+            "breakdown": official_breakdown(p0, val, train, a.manifest_dir)[0],
+            "probe_alone": bool(present_init) and a.fusion == "aga"}
+    print(f"before training  val action MT5R {init['val']['all']['primary_score']:.2f}  "
+          f"verb {init['val']['all']['verb_mt5r']:.2f}  noun {init['val']['all']['noun_mt5r']:.2f}"
+          + ("  (= the probe alone)" if init["probe_alone"] else ""), flush=True)
+
     history, best, best_epoch, waited = [], -1.0, -1, 0
     for epoch in range(a.epochs):
         model.train()
@@ -350,7 +361,7 @@ def main(argv=None):
         else:
             waited += 1
         (out / "metrics.json").write_text(json.dumps({"best_epoch": best_epoch, "best_val_action_mt5r": best,
-                                                      "history": history}, indent=2))
+                                                      "init": init, "history": history}, indent=2))
         if waited >= a.patience:
             print(f"early stop: no improvement for {a.patience} epochs")
             break
@@ -362,7 +373,7 @@ def main(argv=None):
     best_res = history[best_epoch]["val"]
     breakdown, table = official_breakdown(p, val, train, a.manifest_dir)
     summary = {"best_epoch": best_epoch, "best_val_action_mt5r": best, "best_val": best_res,
-               "best_val_breakdown": breakdown, "history": history}
+               "best_val_breakdown": breakdown, "init": init, "history": history}
     if table:
         print("official breakdown (Member 1's evaluator):\n" + table, flush=True)
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
