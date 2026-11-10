@@ -66,7 +66,8 @@ Checks on read: an STA clip ending after the cutoff raises an error; a legacy am
   | trainable | 7.86 (epoch 0) | falls to 6.6–7.1 (overfits) | epoch 8 |
   | frozen | **8.20** (epoch 2) | stays at 7.75–8.04 | epoch 10 |
 
-  `EPIC_TRAIN_PRESENT=1` keeps it trainable.
+  `sbatch --export=ALL,EPIC_TRAIN_PRESENT=1 ...` keeps it trainable (wICE jobs do not receive
+  variables set only on the command line, hence `--export`).
 - `model.encode(...)` returns `verb_history`, `noun_history`, `verb_present`, `noun_present`
   (`[B, d]`), `history_available`, `present_available` — the inputs of Member 4's gate.
 - Loss: cross-entropy with label smoothing 0.1 (as Member 2) + 0.5 × auxiliary step loss; no
@@ -98,7 +99,8 @@ sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-memory-%j.out" scripts/trai
        --mode decoupled --steps 16
 # 2) the ablation (11 runs, 3 at a time): see the header of the script for the rows
 sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-ablation-%A_%a.out" scripts/sta_memory_ablation.slurm
-SEED=1 sbatch ...   # optional extra seeds for error bars
+sbatch --array=4-7%3 -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-ablation-%A_%a.out" \
+       scripts/sta_memory_ablation.slurm 1      # extra seed (argument, default 42) for error bars
 # 3) report material (tables always; figures where matplotlib is installed)
 python scripts/report_sta_memory.py --runs-dir "$EPIC_TEAM/results/sta_memory" --out-dir report_sta
 ```
