@@ -23,7 +23,7 @@ if [[ -f "$EPIC_PROJECT/annotations/EPIC_100_test.csv" ]]; then
 fi
 # The probe starts from Member 2's checkpoint and stays FROZEN by default: training it further
 # overfits (first full run: best 7.86 at epoch 0, then down to 6.8), while a frozen probe lets
-# the memory improve on it steadily. EPIC_TRAIN_PRESENT=1 keeps it trainable (ablation).
+# the memory improve on it. sbatch --export=ALL,EPIC_TRAIN_PRESENT=1 keeps it trainable.
 STA_INIT_ARGS=()
 if [[ -f "$EPIC_PROBE_CKPT" ]]; then
     STA_INIT_ARGS=(--present-init "$EPIC_PROBE_CKPT")
