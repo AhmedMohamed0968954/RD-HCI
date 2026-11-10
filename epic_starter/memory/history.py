@@ -7,6 +7,11 @@ so the last step lands on c. Each step takes the latest bank clip whose end time
 tau, and therefore never after c. Steps are invalid (masked) when tau_k < 0, when no
 clip ends at or before tau_k, or when the nearest one is older than `tolerance`.
 An optional exact `anchor` clip (ending at c) replaces the last step.
+
+With present_tokens=True each item also carries the full-token "present" clip for a token-level
+present encoder (Member 2's factorized probe): the exact STA clip when it was extracted,
+otherwise the bank clip used for the last step (ends at most `tolerance` before c), so events
+without an extracted STA clip (e.g. the hidden test) still get a legal present clip.
 """
 from __future__ import annotations
 from bisect import bisect_left
@@ -29,7 +34,8 @@ def step_times(cutoff: float, steps: int = 16, stride: float = 1.0) -> np.ndarra
 
 def build_history(event: Event, entry: dict | None, steps=16, stride=1.0, tolerance=None,
                   anchor: torch.Tensor | None = None, shape=None) -> dict:
-    """Return feats [S,T,D] (zeros where invalid), valid [S], step_times [S], used_times [S]."""
+    """Return feats [S,T,D] (zeros where invalid), valid [S], step_times [S], used_times [S] and
+    positions [S] (index into this video's time-sorted bank; -1 invalid, -2 exact anchor)."""
     taus = step_times(event.sta_cutoff, steps, stride)
     tolerance = stride if tolerance is None else tolerance
     if entry is None and shape is None:
@@ -38,6 +44,7 @@ def build_history(event: Event, entry: dict | None, steps=16, stride=1.0, tolera
     feats = torch.zeros(steps, T, D, dtype=torch.float32)
     valid = np.zeros(steps, dtype=bool)
     used = np.full(steps, np.nan)
+    positions = np.full(steps, -1, dtype=np.int64)
     if entry is not None:
         times = entry["times"]
         for k, tau in enumerate(taus):
@@ -47,17 +54,17 @@ def build_history(event: Event, entry: dict | None, steps=16, stride=1.0, tolera
             if i < 0 or tau - times[i] > tolerance + EPS:
                 continue
             feats[k] = entry["feats"][i].float()
-            valid[k], used[k] = True, times[i]
+            valid[k], used[k], positions[k] = True, times[i], i
     if anchor is not None and event.sta_cutoff >= 0:
         if tuple(anchor.shape) != (T, D):
             raise ValueError("Anchor must have the same [T,D] as the bank")
         feats[-1] = anchor.float()
-        valid[-1], used[-1] = True, event.sta_cutoff
+        valid[-1], used[-1], positions[-1] = True, event.sta_cutoff, -2
     # Hard leakage guarantee: nothing used ends after its step time or after the cutoff.
     ok = valid
     if (used[ok] > taus[ok] + EPS).any() or (used[ok] > event.sta_cutoff + EPS).any():
         raise AssertionError(f"Leakage: feature after cutoff for {event.narration_id}")
-    return {"feats": feats, "valid": valid, "step_times": taus, "used_times": used}
+    return {"feats": feats, "valid": valid, "step_times": taus, "used_times": used, "positions": positions}
 
 
 class AuxLabeler:
@@ -90,13 +97,18 @@ class AuxLabeler:
 
 
 class HistoryDataset(Dataset):
-    """One item per STA event. Works with any FeatureBank (mock now, real later)."""
+    """One item per STA event. Works with any FeatureBank (mock now, real later).
+
+    anchors: an Anchors object (sta_obs_tokens.npy) or a dict {narration_id: tokens}. Anchors may
+    hold all T tokens while the bank is pooled: the memory then uses their token mean.
+    present_tokens: also return the full-token present clip (see module docstring).
+    """
 
     def __init__(self, events, bank: FeatureBank, steps=16, stride=1.0, tolerance=None,
-                 aux: AuxLabeler | None = None, anchors=None):
-        # anchors: an Anchors object (sta_obs_tokens.npy) or a dict {narration_id: [T,D]}
+                 aux: AuxLabeler | None = None, anchors=None, present_tokens: bool = False):
         self.events, self.bank, self.aux, self.anchors = list(events), bank, aux, anchors or {}
         self.steps, self.stride, self.tolerance = steps, stride, tolerance
+        self.present_tokens = present_tokens
         missing = sorted({e.video_id for e in self.events if e.sta_cutoff >= 0 and e.video_id not in bank})
         if missing:
             raise FileNotFoundError(f"No features for {len(missing)} videos: {missing[:5]}")
@@ -109,18 +121,31 @@ class HistoryDataset(Dataset):
         entry = self.bank[e.video_id] if e.sta_cutoff >= 0 else None
         anchor = (self.anchors.for_event(e) if hasattr(self.anchors, "for_event")
                   else self.anchors.get(e.narration_id))
+        hist_anchor = anchor
+        if anchor is not None and tuple(anchor.shape) != tuple(self.bank.shape):
+            hist_anchor = anchor.float().mean(dim=0, keepdim=True)     # full anchor, pooled bank
         h = build_history(e, entry, self.steps, self.stride, self.tolerance,
-                          anchor, shape=self.bank.shape)
+                          hist_anchor, shape=self.bank.shape)
         if self.aux is not None:
             av, an = self.aux(e.video_id, h["step_times"])
         else:
-            av = an = np.full(self.steps, -1, dtype=np.int64)
+            av, an = np.full(self.steps, -1, dtype=np.int64), np.full(self.steps, -1, dtype=np.int64)
         av[~h["valid"]] = -1
         an[~h["valid"]] = -1
-        return {"feats": h["feats"], "valid": torch.from_numpy(h["valid"]),
+        item = {"feats": h["feats"], "valid": torch.from_numpy(h["valid"]),
                 "step_times": torch.from_numpy(h["step_times"]),
                 "used_times": torch.from_numpy(h["used_times"]),
                 "aux_verb": torch.from_numpy(av), "aux_noun": torch.from_numpy(an),
                 "verb_label": torch.tensor(-1 if e.verb is None else e.verb),
                 "noun_label": torch.tensor(-1 if e.noun is None else e.noun),
                 "use_prior": not h["valid"].any(), "narration_id": e.narration_id}
+        if self.present_tokens:
+            shape = self.bank.token_shape
+            if anchor is not None and tuple(anchor.shape) == tuple(shape):
+                present, source = anchor.float(), 1                     # exact STA clip
+            elif h["valid"][-1] and h["positions"][-1] >= 0:
+                present, source = self.bank.full_tokens(e.video_id, int(h["positions"][-1])).float(), 2
+            else:
+                present, source = torch.zeros(shape), 0
+            item["present_tokens"], item["present_source"] = present, torch.tensor(source)
+        return item

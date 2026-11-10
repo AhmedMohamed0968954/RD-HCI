@@ -6,9 +6,10 @@ own predictions are used in training and testing, never labels).
 Query = EMA of p over valid steps (alpha), keys = p of earlier steps, values = their features.
 mode="single": one memory over concatenated [p_verb, p_noun] (97+300 = 397 dims).
 mode="decoupled": a verb memory and a noun memory with their own keys/values.
-A sigmoid gate mixes the retrieved history h with the current-step evidence e (AGA's 2-way
-gate). `encode()` exposes h and e per field so GatedAGAModel can use Member 4's ThreeWayGate.
-Token pooling is a plain mean here; Member 2's factorized probe can replace `pool`.
+Per field (verb / noun) a sigmoid gate mixes the retrieved history h with the present evidence e
+(AGA's 2-way gate). The present is either the memory's last step (token mean) or Member 2's
+factorized probe on the full 24 tokens of the present clip (present_encoder="probe").
+`encode()` exposes h and e per field so GatedAGAModel can use Member 4's ThreeWayGate.
 """
 from __future__ import annotations
 import torch
@@ -66,40 +67,90 @@ class Memory(nn.Module):
 
 
 class AGAMemoryModel(nn.Module):
-    def __init__(self, feat_dim, d=256, heads=4, alpha=0.8, mode="decoupled", dropout=0.3):
+    """AGA memory with a present-clip encoder.
+
+    present_encoder="mean"   the present is the memory's own last-step embedding (token mean).
+    present_encoder="probe"  the present clip's 24 tokens go through Member 2's
+                             FactorizedAttentiveProbe (separate verb / noun embeddings). Its own
+                             verb/noun logits are the base prediction and the memory adds a
+                             correction (zero-initialised), so a probe initialised from Member 2's
+                             checkpoint starts exactly at the probe's score.
+    """
+
+    def __init__(self, feat_dim, d=256, heads=4, alpha=0.8, mode="decoupled", dropout=0.3,
+                 present_encoder="mean", freeze_present=False):
         super().__init__()
         if mode not in {"single", "decoupled"}:
             raise ValueError("mode must be single or decoupled")
+        if present_encoder not in {"mean", "probe"}:
+            raise ValueError("present_encoder must be mean or probe")
         if d % heads:
             raise ValueError("d must be divisible by heads")
-        self.mode = mode
+        self.mode, self.present_encoder, self.freeze_present = mode, present_encoder, freeze_present
         self.pool = lambda x: x.mean(dim=2)                       # [B,S,T,D] -> [B,S,D]
         self.fx = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
         self.aux_verb, self.aux_noun = nn.Linear(d, N_VERB), nn.Linear(d, N_NOUN)
         if mode == "single":
             self.mem = Memory(N_VERB + N_NOUN, d, heads, alpha)
-            self.gate = Gate(d)
         else:
             self.mem_v, self.mem_n = Memory(N_VERB, d, heads, alpha), Memory(N_NOUN, d, heads, alpha)
-            self.gate_v, self.gate_n = Gate(d), Gate(d)
+        self.gate_v, self.gate_n = Gate(d), Gate(d)
         self.head_verb = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_VERB))
         self.head_noun = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_NOUN))
+        if present_encoder == "probe":
+            from epic_starter.models.factorized_probe import FactorizedAttentiveProbe   # Member 2
+            self.present = FactorizedAttentiveProbe(embed_dim=feat_dim, mode="factorized")
+            self.present_v = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, d))
+            self.present_n = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, d))
+            for head in (self.head_verb, self.head_noun):         # memory starts as a zero correction
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
+            if freeze_present:
+                self.present.requires_grad_(False)
 
-    def encode(self, feats, valid):
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_present and self.present_encoder == "probe":
+            self.present.eval()                                   # frozen probe: no dropout
+        return self
+
+    def load_present(self, path, map_location="cpu"):
+        """Initialise the present probe from Member 2's train_probe.py checkpoint (best.pt)."""
+        if self.present_encoder != "probe":
+            raise ValueError("load_present needs present_encoder='probe'")
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        if ckpt.get("mode") not in (None, "factorized") or ckpt.get("task") not in (None, "STA"):
+            raise ValueError(f"Expected an STA 'factorized' probe checkpoint, got task={ckpt.get('task')} "
+                             f"mode={ckpt.get('mode')}")
+        self.present.load_state_dict(ckpt["model"])               # strict: shapes and keys must match
+        return ckpt.get("epoch"), ckpt.get("metrics", {}).get("all", {}).get("action_mt5r")
+
+    def encode(self, feats, valid, present_tokens=None, present_available=None):
         """Memory outputs for any fusion head (e.g. Member 4's ThreeWayGate), all [B, d]:
         verb_history / noun_history  h_t per field (identical in single mode)
-        present                      e_t of the last step (the clip ending at the cutoff)
+        verb_present / noun_present  e_t per field (identical with the mean present encoder)
         history_available            [B] bool, at least one valid step before the last
-        present_available            [B] bool, the last step is valid
-        plus the auxiliary per-step logits and attention weights.
+        present_available            [B] bool, a present clip exists
+        plus the auxiliary per-step logits, attention weights and (probe) base logits.
         """
         valid = valid.bool()
         e = self.fx(self.pool(feats.float())) * valid[..., None]  # invalid steps contribute nothing
         aux_v, aux_n = self.aux_verb(e), self.aux_noun(e)
         pv, pn = aux_v.softmax(-1).detach(), aux_n.softmax(-1).detach()
         pv, pn = pv * valid[..., None], pn * valid[..., None]
-        z = {"present": e[:, -1], "history_available": valid[:, :-1].any(dim=1),
-             "present_available": valid[:, -1], "aux_verb_logits": aux_v, "aux_noun_logits": aux_n}
+        z = {"history_available": valid[:, :-1].any(dim=1), "aux_verb_logits": aux_v, "aux_noun_logits": aux_n}
+        if self.present_encoder == "mean":
+            z.update(verb_present=e[:, -1], noun_present=e[:, -1], present_available=valid[:, -1])
+        else:
+            if present_tokens is None or present_available is None:
+                raise ValueError("present_encoder='probe' needs present_tokens and present_available")
+            avail = present_available.bool()
+            ev, en = self.present.encode_tokens(present_tokens.float())
+            keep = avail[:, None].float()
+            z.update(verb_present=self.present_v(ev) * keep, noun_present=self.present_n(en) * keep,
+                     present_available=avail,
+                     base_verb_logits=self.present.verb_head(ev) * keep,
+                     base_noun_logits=self.present.noun_head(en) * keep)
         if self.mode == "single":
             h, w = self.mem(torch.cat([pv, pn], -1), e, valid)
             z.update(verb_history=h, noun_history=h, attn=w)
@@ -109,60 +160,67 @@ class AGAMemoryModel(nn.Module):
             z.update(verb_history=hv, noun_history=hn, attn_verb=wv, attn_noun=wn)
         return z
 
-    def forward(self, feats, valid):
-        z = self.encode(feats, valid)
+    def forward(self, feats, valid, present_tokens=None, present_available=None):
+        z = self.encode(feats, valid, present_tokens, present_available)
         extra = {k: z[k] for k in ("attn", "attn_verb", "attn_noun") if k in z}
-        if self.mode == "single":
-            o, g = self.gate(z["verb_history"], z["present"])
-            ov = on = o
-            extra["gate"] = g
-        else:
-            ov, gv = self.gate_v(z["verb_history"], z["present"])
-            on, gn = self.gate_n(z["noun_history"], z["present"])
-            extra.update(gate_verb=gv, gate_noun=gn)
-        return {"verb_logits": self.head_verb(ov), "noun_logits": self.head_noun(on),
+        ov, gv = self.gate_v(z["verb_history"], z["verb_present"])
+        on, gn = self.gate_n(z["noun_history"], z["noun_present"])
+        extra.update(gate_verb=gv, gate_noun=gn)
+        verb, noun = self.head_verb(ov), self.head_noun(on)
+        if "base_verb_logits" in z:
+            verb, noun = verb + z["base_verb_logits"], noun + z["base_noun_logits"]
+        return {"verb_logits": verb, "noun_logits": noun,
                 "aux_verb_logits": z["aux_verb_logits"], "aux_noun_logits": z["aux_noun_logits"], **extra}
 
 
 class GatedAGAModel(nn.Module):
     """AGA memory + an external verb/noun fusion head with the GatedVerbNounHead interface
-    (Member 4, epic_starter/models/gate.py): head((h_v, e, f_v), (h_n, e, f_n), available).
+    (Member 4, epic_starter/models/gate.py): head((h_v, e_v, f_v), (h_n, e_n, f_n), available).
 
     Until future latents exist the future branch is zeros and marked unavailable, so the head
     fuses history and present only. Pass `future=(f_verb, f_noun)` ([B, d] each) once Member 4's
-    predictor features are wired in.
+    predictor features are wired in. With the probe present encoder, the probe's logits stay the
+    base prediction and the gated head adds to them.
     """
 
     def __init__(self, memory: AGAMemoryModel, head: nn.Module):
         super().__init__()
         self.memory, self.head = memory, head
+        if memory.present_encoder == "probe":
+            for lin in (head.verb_head, head.noun_head):
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
 
-    def forward(self, feats, valid, future=None):
-        z = self.memory.encode(feats, valid)
-        B = z["present"].shape[0]
+    def forward(self, feats, valid, present_tokens=None, present_available=None, future=None):
+        z = self.memory.encode(feats, valid, present_tokens, present_available)
+        ref = z["verb_present"]
         if future is None:
-            fv = fn = torch.zeros_like(z["present"])
-            has_future = torch.zeros(B, dtype=torch.bool, device=z["present"].device)
+            fv = fn = torch.zeros_like(ref)
+            has_future = torch.zeros(ref.shape[0], dtype=torch.bool, device=ref.device)
         else:
             fv, fn = future
-            has_future = torch.ones(B, dtype=torch.bool, device=z["present"].device)
+            has_future = torch.ones(ref.shape[0], dtype=torch.bool, device=ref.device)
         available = torch.stack([z["history_available"], z["present_available"], has_future], dim=1)
-        out = self.head((z["verb_history"], z["present"], fv), (z["noun_history"], z["present"], fn),
+        out = self.head((z["verb_history"], z["verb_present"], fv), (z["noun_history"], z["noun_present"], fn),
                         available=available)
+        if "base_verb_logits" in z:
+            out["verb_logits"] = out["verb_logits"] + z["base_verb_logits"]
+            out["noun_logits"] = out["noun_logits"] + z["base_noun_logits"]
         out.update({k: z[k] for k in ("aux_verb_logits", "aux_noun_logits", "attn", "attn_verb", "attn_noun")
                     if k in z})
         return out
 
 
-def aga_loss(out, batch, aux_weight=0.5, verb_weight=None, noun_weight=None):
+def aga_loss(out, batch, aux_weight=0.5, verb_weight=None, noun_weight=None, label_smoothing=0.0):
     """CE on the final verb/noun plus auxiliary CE on labelled valid steps (-1 is ignored).
     Events with no valid step (use_prior) are excluded from the main loss: they get the prior.
     """
     keep = ~batch["use_prior"] if torch.is_tensor(batch["use_prior"]) else torch.ones(len(out["verb_logits"]), dtype=torch.bool)
     yv, yn = batch["verb_label"].clone(), batch["noun_label"].clone()
     yv[~keep], yn[~keep] = -1, -1
-    main = F.cross_entropy(out["verb_logits"], yv, weight=verb_weight, ignore_index=-1) \
-         + F.cross_entropy(out["noun_logits"], yn, weight=noun_weight, ignore_index=-1)
+    ls = label_smoothing
+    main = F.cross_entropy(out["verb_logits"], yv, weight=verb_weight, ignore_index=-1, label_smoothing=ls) \
+         + F.cross_entropy(out["noun_logits"], yn, weight=noun_weight, ignore_index=-1, label_smoothing=ls)
     av, an = batch["aux_verb"].reshape(-1), batch["aux_noun"].reshape(-1)
     aux = 0.0
     if (av >= 0).any():

@@ -154,7 +154,7 @@ def test_encode_exposes_history_and_present_per_field(mode):
     feats = torch.randn(3, 5, 3, 8)
     valid = torch.tensor([[True] * 5, [False, False, False, False, True], [False] * 5])
     z = model.encode(feats, valid)
-    for k in ("verb_history", "noun_history", "present"):
+    for k in ("verb_history", "noun_history", "verb_present", "noun_present"):
         assert z[k].shape == (3, 16) and torch.isfinite(z[k]).all()
     assert z["history_available"].tolist() == [True, False, False]
     assert z["present_available"].tolist() == [True, True, False]
@@ -190,3 +190,18 @@ def test_extractor_edge_rows_are_ignored(tmp_path):
     anchors = Anchors(tmp_path)
     assert anchors.for_event(events[1]) is None          # cutoff >= 0 but no observable frame
     assert anchors.for_event(events[0]) is not None
+
+
+def test_loader_agrees_with_member1_history_rows(tmp_path):
+    """Independent cross-check: Member 1's leakage.history_rows picks the same bank clips."""
+    leakage = pytest.importorskip("epic_starter.leakage")
+    pd = pytest.importorskip("pandas")
+    events = [ev(5.0, nid="early"), ev(14.37, nid="mid"), ev(30.9, nid="late"), ev(0.4, nid="cold")]
+    write_mock_consolidated(events, tmp_path, tokens=3, dim=4)
+    bank = FeatureBank(root=tmp_path)
+    idx = pd.read_csv(tmp_path / "bank_index.csv")
+    for e in events:
+        rows, ends, _ = leakage.history_rows(idx[idx.video_id == e.video_id], e.sta_cutoff, steps=16)
+        h = build_history(e, bank[e.video_id] if e.sta_cutoff >= 0 else None, steps=16, shape=bank.shape)
+        assert np.array_equal(np.isnan(ends), ~h["valid"]), e.narration_id
+        assert np.allclose(ends[h["valid"]], h["used_times"][h["valid"]]), e.narration_id
