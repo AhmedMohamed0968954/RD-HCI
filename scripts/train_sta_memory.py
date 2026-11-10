@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -60,6 +61,11 @@ def parse_args(argv=None):
     m.add_argument("--heads", type=int, default=8)
     m.add_argument("--alpha", type=float, default=0.8, help="EMA weight of the newest prediction")
     m.add_argument("--dropout", type=float, default=0.5)
+    m.add_argument("--present-encoder", choices=["probe", "mean"], default="probe",
+                   help="probe: Member 2's factorized probe on the present clip's 24 tokens (default); "
+                        "mean: the memory's own token-mean embedding of the last step (ablation)")
+    m.add_argument("--present-init", help="Member 2's STA factorized probe checkpoint (best.pt) to start from")
+    m.add_argument("--freeze-present", action="store_true", help="keep the initialised probe fixed")
     m.add_argument("--fusion", choices=["aga", "three_way"], default="aga",
                    help="aga: AGA's 2-way gate (baseline); three_way: Member 4's ThreeWayGate "
                         "(history + present now, future branch once predictor features exist)")
@@ -70,6 +76,7 @@ def parse_args(argv=None):
     t.add_argument("--lr", type=float, default=2e-4)
     t.add_argument("--weight-decay", type=float, default=0.01)
     t.add_argument("--aux-weight", type=float, default=0.5)
+    t.add_argument("--label-smoothing", type=float, default=0.1, help="same as Member 2's probe training")
     t.add_argument("--class-weights", choices=["none", "sqrt", "inv"], default="none",
                    help="none keeps plain CE so Member 1's post-hoc logit adjustment stays valid")
     t.add_argument("--seed", type=int, default=42)
@@ -79,6 +86,10 @@ def parse_args(argv=None):
     a = p.parse_args(argv)
     if bool(a.manifest_dir) == bool(a.train_csv):
         p.error("give exactly one of --manifest-dir or --train-csv")
+    if (a.present_init or a.freeze_present) and a.present_encoder != "probe":
+        p.error("--present-init / --freeze-present need --present-encoder probe")
+    if a.freeze_present and not a.present_init:
+        p.error("--freeze-present needs --present-init")
     return a
 
 
@@ -120,7 +131,8 @@ def class_weights(events, kind):
 
 
 def subsets(events, train):
-    """Unseen participants and tail actions (classes outside the head covering 80% of training)."""
+    """Unseen participants and tail actions (classes outside the head covering 80% of training);
+    same definitions and names as Member 2's train_probe.py, so tables line up."""
     seen = {e.participant_id for e in train}
     counts = defaultdict(int)
     for e in train:
@@ -131,8 +143,62 @@ def subsets(events, train):
             break
         head.add(key)
         acc += c
-    return {"unseen_participants": np.array([e.participant_id not in seen for e in events]),
-            "tail_actions": np.array([(e.verb, e.noun) not in head for e in events])}
+    return {"unseen": np.array([e.participant_id not in seen for e in events]),
+            "tail": np.array([(e.verb, e.noun) not in head for e in events])}
+
+
+def head_tail(labels, n_classes, head_share=0.8):
+    """Classes outside the most frequent ones covering head_share of the instances (EPIC-100 style,
+    as Member 1's hybrid_split.tail_classes); from TRAINING labels only."""
+    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=n_classes)
+    total, running, tail = counts.sum(), 0, []
+    for c in np.argsort(-counts, kind="stable"):
+        if counts[c] == 0:
+            continue
+        if running >= head_share * total:
+            tail.append(int(c))
+        running += counts[c]
+    return sorted(tail)
+
+
+def official_breakdown(p, val, train, manifest_dir):
+    """Member 1's overall / seen / unseen / tail table (epic_metrics.evaluate_breakdown), when
+    available. Tail classes come from tail_classes.json of the split, else from training counts."""
+    try:
+        from epic_starter.epic_metrics import evaluate_breakdown, format_breakdown
+    except ImportError:
+        return None, None
+    tail_file = Path(manifest_dir) / "tail_classes.json" if manifest_dir else None
+    if tail_file is not None and tail_file.is_file():
+        t = json.loads(tail_file.read_text())
+        tv, tn = t["verbs"], t["nouns"]
+    else:
+        tv, tn = head_tail([e.verb for e in train], N_VERB), head_tail([e.noun for e in train], N_NOUN)
+    seen = {e.participant_id for e in train}
+    r = evaluate_breakdown(p["verb_logits"], p["noun_logits"], p["verb_label"], p["noun_label"], task="STA",
+                           unseen_mask=np.array([e.participant_id not in seen for e in val]),
+                           tail_verbs=tv, tail_nouns=tn)
+    return r, format_breakdown(r)
+
+
+def cold_start_scores(train, manifest_dir):
+    """Scores for events with no observable frame. Member 1's cold_start_prior.json (actions in the
+    first 5 s of training videos) when the split provides it, else the overall training prior."""
+    path = Path(manifest_dir) / "cold_start_prior.json" if manifest_dir else None
+    if path is not None and path.is_file():
+        prior, source = json.loads(path.read_text()), str(path)
+    else:
+        prior, source = training_priors(train), "training class frequencies"
+    return np.log(prior["verb_output"]), np.log(prior["noun_output"]), source
+
+
+def run_model(model, b, device):
+    """Forward pass for both present encoders (present tokens are only in the batch for 'probe')."""
+    if "present_tokens" in b:
+        return model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True),
+                     b["present_tokens"].to(device, non_blocking=True),
+                     (b["present_source"] > 0).to(device, non_blocking=True))
+    return model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True))
 
 
 @torch.no_grad()
@@ -140,7 +206,7 @@ def predict(model, loader, device, prior_v, prior_n, extras=False):
     model.eval()
     out = defaultdict(list)
     for b in loader:
-        r = model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True))
+        r = run_model(model, b, device)
         v, n = r["verb_logits"].float().cpu().numpy(), r["noun_logits"].float().cpu().numpy()
         cold = b["use_prior"].numpy().astype(bool)
         v[cold], n[cold] = prior_v, prior_n                 # cold start: training prior
@@ -150,6 +216,8 @@ def predict(model, loader, device, prior_v, prior_n, extras=False):
             out[k].append(x)
         if extras:
             out["step_valid"].append(b["valid"].numpy())
+            if "present_source" in b:
+                out["present_source"].append(b["present_source"].numpy())
             for k in ("attn", "attn_verb", "attn_noun"):          # [B,H,S-1] -> mean over heads
                 if k in r:
                     out[k].append(r[k].mean(1).float().cpu().numpy())
@@ -179,18 +247,31 @@ def main(argv=None):
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
     device = torch.device(a.device)
+    if device.type == "cpu":                       # the cores Slurm gave us, minus the data workers
+        cores = int(os.environ.get("SLURM_CPUS_PER_TASK", torch.get_num_threads()))
+        torch.set_num_threads(max(1, cores - a.num_workers))
 
     train, val, test = load_splits(a)
     pooled = not a.no_pool
+    probe = a.present_encoder == "probe"
     if a.features_dir:
         bank = FeatureBank(root=a.features_dir, pooled=pooled, cache_dir=a.pool_cache)
-        anchors = None if a.no_anchor else Anchors(a.features_dir, pooled=pooled, cache_dir=a.pool_cache)
+        # the probe needs all 24 tokens of the exact STA clip; the memory uses their mean
+        anchors = None if a.no_anchor else Anchors(a.features_dir, pooled=pooled and not probe,
+                                                   cache_dir=a.pool_cache)
     else:
         print("WARNING: no --features-dir, using random MOCK features (pipeline test only)")
         bank, anchors = make_mock_bank(train + val + test, tokens=24, dim=64, encode_time=False), None
         if pooled:
             bank = FeatureBank({k: v for k, v in bank.entries.items()}, pooled=True)
     T, D = bank.shape
+    D = bank.token_shape[1]
+    if anchors is not None and test:
+        missing = sum(e.sta_cutoff >= 0 and anchors.rows.get(e.narration_id) is None for e in test)
+        if missing:
+            print(f"WARNING: {missing}/{len(test)} test events have no extracted STA clip; their present "
+                  "clip falls back to the last bank clip (<= 1 s earlier). Ask Member 2 to extract the "
+                  "test events, or train with --no-anchor so training matches test.", flush=True)
     bank_stride = bank.meta.get("bank_stride_s", bank.meta.get("bank_stride_seconds"))
     if getattr(bank, "dropped", None) and any(bank.dropped.values()):
         print(f"feature bank: ignored rows {bank.dropped}", flush=True)
@@ -200,34 +281,43 @@ def main(argv=None):
     print(f"events train {len(train)} / val {len(val)} / test {len(test)}; features [T,D]=[{T},{D}]; "
           f"mode {a.mode}, S={a.steps}, stride {a.stride}s, device {device}", flush=True)
 
-    prior = training_priors(train)
-    prior_v, prior_n = np.log(prior["verb_output"]), np.log(prior["noun_output"])
-    sets = {"train": HistoryDataset(train, bank, a.steps, a.stride, aux=AuxLabeler(train), anchors=anchors),
-            "val": HistoryDataset(val, bank, a.steps, a.stride, anchors=anchors)}
+    prior_v, prior_n, prior_source = cold_start_scores(train, a.manifest_dir)
+    kw_ds = dict(anchors=anchors, present_tokens=probe)
+    sets = {"train": HistoryDataset(train, bank, a.steps, a.stride, aux=AuxLabeler(train), **kw_ds),
+            "val": HistoryDataset(val, bank, a.steps, a.stride, **kw_ds)}
     if test:
-        sets["test"] = HistoryDataset(test, bank, a.steps, a.stride, anchors=anchors)
+        sets["test"] = HistoryDataset(test, bank, a.steps, a.stride, **kw_ds)
     kw = dict(batch_size=a.batch_size, num_workers=a.num_workers, pin_memory=device.type == "cuda",
               persistent_workers=a.num_workers > 0)
     loaders = {k: DataLoader(ds, shuffle=(k == "train"), generator=torch.Generator().manual_seed(a.seed), **kw)
                for k, ds in sets.items()}
     masks = subsets(val, train)
 
-    ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout)
+    ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout,
+                present_encoder=a.present_encoder, freeze_present=a.freeze_present)
     model = AGAMemoryModel(**ctor)
+    present_init = None
+    if a.present_init:
+        epoch0, score0 = model.load_present(a.present_init)
+        present_init = {"path": a.present_init, "epoch": epoch0, "val_action_mt5r": score0}
+        print(f"present probe initialised from {a.present_init} (its val action MT5R: {score0})", flush=True)
     if a.fusion == "three_way":
         from epic_starter.models.gate import GatedVerbNounHead   # Member 4
         model = GatedAGAModel(model, GatedVerbNounHead(in_dim=a.d_model))
     model = model.to(device)
     wv, wn = class_weights(train, a.class_weights)
     wv, wn = (wv.to(device) if wv is not None else None), (wn.to(device) if wn is not None else None)
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr,
+                            weight_decay=a.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
 
     config = {"args": vars(a), "git_commit": git_commit(), "feature_meta": bank.meta,
               "feature_shape": [T, D], "events": {k: len(ds) for k, ds in sets.items()},
               "cold_start_events": {k: int(sum(e.sta_cutoff < 0 for e in ds.events)) for k, ds in sets.items()},
+              "present_init": present_init, "cold_start_prior": prior_source,
               "torch": torch.__version__, "python": platform.python_version(),
-              "parameters": sum(p.numel() for p in model.parameters())}
+              "parameters": sum(p.numel() for p in model.parameters()),
+              "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)}
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
     history, best, best_epoch, waited = [], -1.0, -1, 0
@@ -236,10 +326,10 @@ def main(argv=None):
         t0, losses = time.time(), []
         for b in loaders["train"]:
             b = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
-            loss = aga_loss(model(b["feats"], b["valid"]), b, a.aux_weight, wv, wn)
+            loss = aga_loss(run_model(model, b, device), b, a.aux_weight, wv, wn, a.label_smoothing)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step()
             losses.append(loss.item())
         sched.step()
@@ -270,8 +360,11 @@ def main(argv=None):
     np.savez_compressed(out / "val_outputs.npz", **{k: np.asarray(v) for k, v in p.items()},
                         prior_verb=prior_v, prior_noun=prior_n)
     best_res = history[best_epoch]["val"]
+    breakdown, table = official_breakdown(p, val, train, a.manifest_dir)
     summary = {"best_epoch": best_epoch, "best_val_action_mt5r": best, "best_val": best_res,
-               "history": history}
+               "best_val_breakdown": breakdown, "history": history}
+    if table:
+        print("official breakdown (Member 1's evaluator):\n" + table, flush=True)
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
     print("best epoch", best_epoch, json.dumps({k: v for k, v in best_res["all"].items()
                                                 if isinstance(v, (int, float))}))

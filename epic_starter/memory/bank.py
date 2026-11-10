@@ -28,6 +28,15 @@ import torch
 EPS = 1e-6
 
 
+def cache_path(cache_dir, root: Path, array_name: str) -> Path | None:
+    """Cache file for the token mean of root/array_name, keyed by the source file's size and
+    modification time, so re-extracted or re-consolidated features never reuse a stale cache."""
+    if not cache_dir:
+        return None
+    st = (root / array_name).stat()
+    return Path(cache_dir) / root.name / f"{Path(array_name).stem}_mean_{st.st_size}_{st.st_mtime_ns}.npy"
+
+
 def mean_tokens(array, cache: Path | None = None, chunk: int = 2048) -> np.ndarray:
     """[M,T,D] -> [M,1,D] float16 by averaging tokens, streamed in chunks (never all in RAM).
     With `cache`, the result is saved there once (atomic rename) and reused by later runs.
@@ -86,6 +95,8 @@ class FeatureBank:
         self.root = Path(root) if root is not None else None
         self.pooled = pooled
         self._array = None
+        self._full = None            # memmap of all T tokens (consolidated) when pooled
+        self._full_entries = {}      # all T tokens (in-memory) when pooled
         self.entries, self.index, self.dropped = {}, {}, {}
         if entries is not None:
             for video_id, e in entries.items():
@@ -96,6 +107,7 @@ class FeatureBank:
                 if feats.shape[0] != len(times):
                     raise ValueError(f"{video_id}: feats and times differ in length")
                 if pooled:
+                    self._full_entries[video_id] = feats
                     feats = feats.float().mean(dim=1, keepdim=True).half()
                 self.entries[video_id] = {"times": times, "feats": feats}
             shapes = {tuple(e["feats"].shape[1:]) for e in self.entries.values()}
@@ -122,9 +134,9 @@ class FeatureBank:
             header = np.load(self.root / "bank_tokens.npy", mmap_mode="r")
             n_rows = header.shape[0]
             if pooled:
-                cache = Path(cache_dir) / self.root.name / "bank_tokens_mean.npy" if cache_dir else None
-                self._array = mean_tokens(header, cache)      # in RAM, safe to share with workers
+                self._array = mean_tokens(header, cache_path(cache_dir, self.root, "bank_tokens.npy"))
             shapes = {tuple(self._array.shape[1:]) if pooled else tuple(header.shape[1:])}
+            self.token_shape = tuple(header.shape[1:])
             del header
             used = np.concatenate([rows for _, rows in self.index.values()]) if self.index else np.array([])
             if len(used) and (used.min() < 0 or used.max() >= n_rows):
@@ -132,6 +144,11 @@ class FeatureBank:
         if len(shapes) > 1:
             raise ValueError(f"All videos must share [T,D]; found {shapes}")
         self.shape = next(iter(shapes)) if shapes else None
+        if entries is not None:
+            if self._full_entries:
+                self.token_shape = tuple(next(iter(self._full_entries.values())).shape[1:])
+            else:
+                self.token_shape = self.shape
         meta = self.root / "meta.json" if self.root else None
         self.meta = json.loads(meta.read_text()) if meta and meta.is_file() else {}
 
@@ -139,7 +156,21 @@ class FeatureBank:
         state = dict(self.__dict__)
         if not self.pooled:
             state["_array"] = None
+        state["_full"] = None
         return state
+
+    def full_tokens(self, video_id: str, position: int) -> torch.Tensor:
+        """All T tokens [T,D] of the clip at `position` in this video's (time-sorted) bank,
+        even when the bank itself is pooled. Used as the present clip when the exact STA clip
+        is missing (e.g. hidden-test events that were not extracted)."""
+        if video_id in self._full_entries:
+            return self._full_entries[video_id][position]
+        if video_id in self.entries:
+            return self.entries[video_id]["feats"][position]
+        _, rows = self.index[video_id]
+        if self._full is None:
+            self._full = np.load(self.root / "bank_tokens.npy", mmap_mode="r")
+        return torch.from_numpy(np.array(self._full[rows[position]]))
 
     def __contains__(self, video_id):
         return video_id in self.entries or video_id in self.index
@@ -174,8 +205,8 @@ class Anchors:
                 # Events without any observable frame keep a zero block in the array: never use it.
                 self.rows[r["narration_id"]] = None if no_clip else (int(r["row"]), end)
         if pooled:
-            cache = Path(cache_dir) / self.root.name / "sta_obs_tokens_mean.npy" if cache_dir else None
-            self._array = mean_tokens(np.load(self.root / "sta_obs_tokens.npy", mmap_mode="r"), cache)
+            self._array = mean_tokens(np.load(self.root / "sta_obs_tokens.npy", mmap_mode="r"),
+                                      cache_path(cache_dir, self.root, "sta_obs_tokens.npy"))
 
     def __getstate__(self):
         state = dict(self.__dict__)

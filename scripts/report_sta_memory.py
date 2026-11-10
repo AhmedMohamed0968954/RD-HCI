@@ -4,6 +4,7 @@
 
 Writes to --out-dir:
   results.csv / results.md   one row per run: mode, S, seed, best epoch, Overall / Unseen / Tail scores
+                             (Unseen / Tail from Member 1's official breakdown when available)
   horizon.png                validation Action MT5R vs history length S, single vs decoupled (mean ± std over seeds)
   <run>_attention.png        where the memory looks: mean attention per second before the cutoff
   <run>_gates.png            how much each stream relies on history vs the present (gate values)
@@ -29,14 +30,24 @@ def load_runs(root: Path):
             continue
         a = cfg["args"]
         row = {"run": run.name, "mode": a["mode"], "steps": a["steps"], "seed": a["seed"],
-               "fusion": a.get("fusion", "aga"),
+               "fusion": a.get("fusion", "aga"), "present": a.get("present_encoder", "mean"),
                "anchor": not a.get("no_anchor", False), "best_epoch": m["best_epoch"]}
+        bd = m.get("best_val_breakdown") or {}
+        row["official_unseen_action_mt5r"] = (bd.get("unseen") or {}).get("action_mt5r")
+        row["official_tail_action_mt5r"] = (bd.get("tail") or {}).get("action_mt5r")
         for subset, res in m["best_val"].items():
-            prefix = {"all": "", "unseen_participants": "unseen_", "tail_actions": "tail_"}.get(subset, subset + "_")
+            prefix = {"all": "", "unseen": "unseen_", "tail": "tail_",
+                      "unseen_participants": "unseen_", "tail_actions": "tail_"}.get(subset, subset + "_")
             for key in ("action_mt5r", "verb_mt5r", "noun_mt5r", "action_top1"):
                 row[prefix + key] = res.get(key)
         runs.append((row, run))
     return runs
+
+
+def prefer_official(row, key):
+    """Member 1's official breakdown when the run has it, else this script's own subset."""
+    value = row.get("official_" + key)
+    return value if value is not None else row.get(key)
 
 
 def fmt(x):
@@ -44,25 +55,27 @@ def fmt(x):
 
 
 def write_tables(rows, out: Path):
-    cols = ["run", "mode", "fusion", "steps", "seed", "anchor", "best_epoch", "action_mt5r", "verb_mt5r", "noun_mt5r",
-            "unseen_action_mt5r", "tail_action_mt5r", "action_top1"]
+    cols = ["run", "mode", "present", "fusion", "steps", "seed", "anchor", "best_epoch", "action_mt5r", "verb_mt5r", "noun_mt5r",
+            "unseen_action_mt5r", "tail_action_mt5r", "official_unseen_action_mt5r",
+            "official_tail_action_mt5r", "action_top1"]
     with (out / "results.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    lines = ["| Mode | Fusion | S | Seed | Action MT5R | Verb MT5R | Noun MT5R | Unseen action | Tail action |",
-             "|---|---|---|---|---|---|---|---|---|"]
-    for r in sorted(rows, key=lambda r: (r["mode"], r["fusion"], r["steps"], r["seed"])):
-        lines.append(f"| {r['mode']}{'' if r['anchor'] else ' (no anchor)'} | {r['fusion']} | {r['steps']} | {r['seed']} | "
+    lines = ["| Memory | Present | Fusion | S | Seed | Action MT5R | Verb MT5R | Noun MT5R | Unseen action | Tail action |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in sorted(rows, key=lambda r: (r["mode"], r["present"], r["fusion"], r["steps"], r["seed"])):
+        lines.append(f"| {r['mode']}{'' if r['anchor'] else ' (no anchor)'} | {r['present']} | {r['fusion']} | "
+                     f"{r['steps']} | {r['seed']} | "
                      f"{fmt(r.get('action_mt5r'))} | {fmt(r.get('verb_mt5r'))} | {fmt(r.get('noun_mt5r'))} | "
-                     f"{fmt(r.get('unseen_action_mt5r'))} | {fmt(r.get('tail_action_mt5r'))} |")
+                     f"{fmt(prefer_official(r, 'unseen_action_mt5r'))} | {fmt(prefer_official(r, 'tail_action_mt5r'))} |")
     (out / "results.md").write_text("\n".join(lines) + "\n")
 
 
 def plot_horizon(rows, out: Path, plt):
     groups = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        if r["anchor"] and r["fusion"] == "aga" and r.get("action_mt5r") is not None:
+        if r["anchor"] and r["fusion"] == "aga" and r["present"] == "probe" and r.get("action_mt5r") is not None:
             groups[r["mode"]][r["steps"]].append(r["action_mt5r"])
     if not groups:
         return
@@ -150,13 +163,18 @@ def main(argv=None):
         raise SystemExit(f"No finished runs (metrics.json with best_val) under {a.runs_dir}")
     rows = [r for r, _ in runs]
     write_tables(rows, out)
-    import matplotlib
+    print((out / "results.md").read_text())
+    try:
+        import matplotlib
+    except ImportError:
+        print("matplotlib is not installed in this environment: tables written, figures skipped. "
+              "Run this script again in an environment with matplotlib for the figures.")
+        return
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plot_horizon(rows, out, plt)
     for _, run in runs:
         plot_run(run, out, plt)
-    print((out / "results.md").read_text())
     print("figures in", out)
 
 
