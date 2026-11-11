@@ -52,8 +52,9 @@ Checks on read: an STA clip ending after the cutoff raises an error; a legacy am
 - Present: `--present-encoder probe` (default, Member 2's `FactorizedAttentiveProbe`, separate
   verb/noun embeddings) or `mean` (ablation: the memory's own last-step token mean).
 - Fusion: per field a 2-way gate (history vs present), or Member 4's three-way gate
-  (`--fusion three_way`; future branch unavailable until predictor features are wired in via
-  `GatedAGAModel(..., future=(f_v, f_n))`).
+  (`--fusion three_way`). Its future branch reads the V-JEPA predictor tokens of the exact STA
+  clip (`--future-encoder mean|probe`, see docs/MEMBER4_PREDICTOR_GATE.md); `--branches` keeps
+  only some gate branches for ablations.
 - With the probe, output = probe logits + memory correction (zero-initialised): with
   `--present-init` the model starts exactly at Member 2's probe score. Every run is scored once
   before training (`init` in `metrics.json`); for these runs that is the probe alone in this
@@ -142,4 +143,5 @@ i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
   `vjepa2_1_vitl_dist_vitG_384.pt` are loaded (the `ek100.yaml` config must not bring EK-100 probe weights).
 - **Member 1:** merge `member1-split-eval`; calibrate `val_outputs.npz` / `test_outputs.npz`
   (tau on one half of the val videos, as in MEMBER1_SPLIT_EVAL.md) and package with AR.
-- **Member 4:** future latents per field (`[B, d]`) for `GatedAGAModel(future=...)`.
+- **Member 4:** future latents per field (`[B, d]`) for `GatedAGAModel(future=...)` (done:
+  `FutureBranch`, `--future-encoder`; results in docs/MEMBER4_GATE_ABLATION.md).

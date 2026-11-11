@@ -177,30 +177,47 @@ class GatedAGAModel(nn.Module):
     """AGA memory + an external verb/noun fusion head with the GatedVerbNounHead interface
     (Member 4, epic_starter/models/gate.py): head((h_v, e_v, f_v), (h_n, e_n, f_n), available).
 
-    Until future latents exist the future branch is zeros and marked unavailable, so the head
-    fuses history and present only. Pass `future=(f_verb, f_noun)` ([B, d] each) once Member 4's
-    predictor features are wired in. With the probe present encoder, the probe's logits stay the
-    base prediction and the gated head adds to them.
+    Without a future branch it is zeros and marked unavailable, so the head fuses history and
+    present only. The future branch comes either as `future=(f_verb, f_noun)` ([B, d] each) or from
+    `future_encoder` (Member 4's FutureBranch, epic_starter/models/future_branch.py) applied to
+    `future_tokens` [B, 24, D]; `future_available` [B] marks the rows that have them. `branches`
+    keeps only some of ("history", "present", "future") for ablations: the others get weight 0.
+    With the probe present encoder, the probe's logits stay the base prediction and the gated head
+    adds to them.
     """
 
-    def __init__(self, memory: AGAMemoryModel, head: nn.Module):
+    BRANCHES = ("history", "present", "future")
+
+    def __init__(self, memory: AGAMemoryModel, head: nn.Module, future_encoder: nn.Module | None = None,
+                 branches=BRANCHES):
         super().__init__()
-        self.memory, self.head = memory, head
+        unknown = set(branches) - set(self.BRANCHES)
+        if unknown or not branches:
+            raise ValueError(f"branches must be a non-empty subset of {self.BRANCHES}, got {branches}")
+        self.memory, self.head, self.future_encoder = memory, head, future_encoder
+        self.branches = tuple(b for b in self.BRANCHES if b in branches)
+        self.register_buffer("branch_mask", torch.tensor([b in branches for b in self.BRANCHES]),
+                             persistent=False)
         if memory.present_encoder == "probe":
             for lin in (head.verb_head, head.noun_head):
                 nn.init.zeros_(lin.weight)
                 nn.init.zeros_(lin.bias)
 
-    def forward(self, feats, valid, present_tokens=None, present_available=None, future=None):
+    def forward(self, feats, valid, present_tokens=None, present_available=None, future=None,
+                future_tokens=None, future_available=None):
         z = self.memory.encode(feats, valid, present_tokens, present_available)
         ref = z["verb_present"]
+        if future is None and future_tokens is not None and self.future_encoder is not None:
+            future = self.future_encoder(future_tokens, future_available)
         if future is None:
             fv = fn = torch.zeros_like(ref)
             has_future = torch.zeros(ref.shape[0], dtype=torch.bool, device=ref.device)
         else:
             fv, fn = future
-            has_future = torch.ones(ref.shape[0], dtype=torch.bool, device=ref.device)
+            has_future = (torch.ones(ref.shape[0], dtype=torch.bool, device=ref.device)
+                          if future_available is None else future_available.bool())
         available = torch.stack([z["history_available"], z["present_available"], has_future], dim=1)
+        available = available & self.branch_mask
         out = self.head((z["verb_history"], z["verb_present"], fv), (z["noun_history"], z["noun_present"], fn),
                         available=available)
         if "base_verb_logits" in z:
