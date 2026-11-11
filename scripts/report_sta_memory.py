@@ -32,7 +32,7 @@ def load_runs(root: Path):
             continue
         a = cfg["args"]
         row = {"run": run.name, "mode": a["mode"], "steps": a["steps"], "seed": a["seed"],
-               "fusion": a.get("fusion", "aga"),
+               "fusion": fusion_label(a),
                "present": a.get("present_encoder", "mean") + (" (frozen)" if a.get("freeze_present") else
                           " (trainable)" if a.get("present_encoder") == "probe" else ""),
                "anchor": not a.get("no_anchor", False), "best_epoch": m["best_epoch"]}
@@ -42,6 +42,19 @@ def load_runs(root: Path):
             row["init"] = scores(init["val"], init.get("breakdown"))
         runs.append((row, run))
     return runs
+
+
+def fusion_label(a):
+    """'aga', or the three-way gate with the branches that can carry weight, e.g. 'three_way H+P+F
+    (future: mean)'. Without a future encoder the future branch is always empty, so it is not listed."""
+    fusion = a.get("fusion", "aga")
+    if fusion != "three_way":
+        return fusion
+    encoder = a.get("future_encoder", "none")
+    kept = [b for b in a.get("branches", "history,present,future").split(",")
+            if b.strip() and (b.strip() != "future" or encoder != "none")]
+    return f"three_way {'+'.join(b.strip()[0].upper() for b in kept)}" + (
+        f" (future: {encoder})" if encoder != "none" else "")
 
 
 def scores(res, breakdown):

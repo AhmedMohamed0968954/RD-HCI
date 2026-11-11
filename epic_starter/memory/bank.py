@@ -187,10 +187,16 @@ class FeatureBank:
 
 
 class Anchors:
-    """Exact clip ending at each event's STA cutoff (sta_obs_tokens.npy + events_index.csv)."""
+    """Exact clip ending at each event's STA cutoff (sta_obs_tokens.npy + events_index.csv).
 
-    def __init__(self, root: str | Path, pooled: bool = False, cache_dir: str | Path | None = None):
+    tokens_file="sta_pred_tokens.npy" reads the V-JEPA predictor tokens of the same clip instead
+    (Member 4's future branch): same rows, same availability and the same leakage check.
+    """
+
+    def __init__(self, root: str | Path, pooled: bool = False, cache_dir: str | Path | None = None,
+                 tokens_file: str = "sta_obs_tokens.npy"):
         self.root, self._array, self.rows, self.pooled = Path(root), None, {}, pooled
+        self.tokens_file = tokens_file
         with (self.root / "events_index.csv").open(newline="") as f:
             reader = csv.DictReader(f)
             if "sta_clip_end_s" not in (reader.fieldnames or []):
@@ -205,8 +211,8 @@ class Anchors:
                 # Events without any observable frame keep a zero block in the array: never use it.
                 self.rows[r["narration_id"]] = None if no_clip else (int(r["row"]), end)
         if pooled:
-            self._array = mean_tokens(np.load(self.root / "sta_obs_tokens.npy", mmap_mode="r"),
-                                      cache_path(cache_dir, self.root, "sta_obs_tokens.npy"))
+            self._array = mean_tokens(np.load(self.root / tokens_file, mmap_mode="r"),
+                                      cache_path(cache_dir, self.root, tokens_file))
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -223,7 +229,7 @@ class Anchors:
             raise AssertionError(f"Leakage: STA clip for {event.narration_id} ends at {end} "
                                  f"> cutoff {event.sta_cutoff}")
         if self._array is None:
-            self._array = np.load(self.root / "sta_obs_tokens.npy", mmap_mode="r")
+            self._array = np.load(self.root / self.tokens_file, mmap_mode="r")
         return torch.from_numpy(np.array(self._array[row]))
 
 
@@ -276,6 +282,15 @@ def write_mock_consolidated(events, root, stride=1.0, tokens=24, dim=32, seed=0)
                         "-1.0" if cold else f"{e.sta_cutoff:.6f}", cold])
     obs.flush()
     del obs
+    # predictor tokens of the same clips (Member 4's future branch); no clip -> zero block, as in
+    # the real extractor
+    pred = np.lib.format.open_memmap(root / "sta_pred_tokens.npy", mode="w+", dtype=np.float16,
+                                     shape=(len(events), tokens, dim))
+    for i, e in enumerate(events):
+        if e.sta_cutoff >= 0:
+            pred[i] = np.random.default_rng(seed + 100_000 + i).standard_normal((tokens, dim)).astype(np.float16)
+    pred.flush()
+    del pred
     (root / "meta.json").write_text(json.dumps({"backbone": "MOCK", "bank_stride_s": stride,
                                                 "tokens": tokens, "dim": dim}, indent=2))
     return root

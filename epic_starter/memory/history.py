@@ -102,13 +102,16 @@ class HistoryDataset(Dataset):
     anchors: an Anchors object (sta_obs_tokens.npy) or a dict {narration_id: tokens}. Anchors may
     hold all T tokens while the bank is pooled: the memory then uses their token mean.
     present_tokens: also return the full-token present clip (see module docstring).
+    future: V-JEPA predictor tokens of the exact STA clip for Member 4's future branch, as an
+    Anchors(..., tokens_file="sta_pred_tokens.npy") or a dict {narration_id: tokens}. Adds
+    "future_tokens" [T, D] and "future_available" (False: no clip, or an all-zero block).
     """
 
     def __init__(self, events, bank: FeatureBank, steps=16, stride=1.0, tolerance=None,
-                 aux: AuxLabeler | None = None, anchors=None, present_tokens: bool = False):
+                 aux: AuxLabeler | None = None, anchors=None, present_tokens: bool = False, future=None):
         self.events, self.bank, self.aux, self.anchors = list(events), bank, aux, anchors or {}
         self.steps, self.stride, self.tolerance = steps, stride, tolerance
-        self.present_tokens = present_tokens
+        self.present_tokens, self.future = present_tokens, future
         missing = sorted({e.video_id for e in self.events if e.sta_cutoff >= 0 and e.video_id not in bank})
         if missing:
             raise FileNotFoundError(f"No features for {len(missing)} videos: {missing[:5]}")
@@ -148,4 +151,12 @@ class HistoryDataset(Dataset):
             else:
                 present, source = torch.zeros(shape), 0
             item["present_tokens"], item["present_source"] = present, torch.tensor(source)
+        if self.future is not None:
+            shape = self.bank.token_shape
+            f = (self.future.for_event(e) if hasattr(self.future, "for_event")
+                 else self.future.get(e.narration_id))
+            ok = (f is not None and tuple(f.shape) == tuple(shape) and bool(torch.isfinite(f).all())
+                  and bool(f.any()))
+            item["future_tokens"] = f.float() if ok else torch.zeros(shape)
+            item["future_available"] = torch.tensor(ok)
         return item

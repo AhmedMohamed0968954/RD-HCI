@@ -14,6 +14,11 @@ One run = one configuration (mode, history length S, seed). It
        submission_sta.pt    uncalibrated STA predictions in Codabench format, every event covered
 Events whose cutoff is before the video start get the training-prior scores (cold start).
 
+With --fusion three_way, Member 4's options add the future branch (V-JEPA predictor tokens of the
+exact STA clip, sta_pred_tokens.npy) and switch gate branches off for ablations:
+    --future-encoder mean --branches history,present,future
+    --branches present        (the memory still runs but the gate ignores it: "history off" control)
+
     python scripts/train_sta_memory.py --features-dir "$EPIC_FEATURES" \
         --manifest-dir "$EPIC_MANIFESTS" --test-csv "$EPIC_PROJECT/annotations/EPIC_100_test.csv" \
         --out-dir "$EPIC_TEAM/results/sta_memory/decoupled_S16_seed42" --mode decoupled --steps 16
@@ -38,6 +43,9 @@ from epic_starter.data.manifests import grouped_split, read_manifest, training_p
 from epic_starter.epic_metrics import evaluate, validate_predictions
 from epic_starter.memory import Anchors, AuxLabeler, FeatureBank, HistoryDataset, make_mock_bank
 from epic_starter.models.aga import N_NOUN, N_VERB, AGAMemoryModel, GatedAGAModel, aga_loss
+from epic_starter.models.future_branch import ENCODERS as FUTURE_ENCODERS     # Member 4
+
+BRANCHES = GatedAGAModel.BRANCHES
 
 
 def parse_args(argv=None):
@@ -68,7 +76,17 @@ def parse_args(argv=None):
     m.add_argument("--freeze-present", action="store_true", help="keep the initialised probe fixed")
     m.add_argument("--fusion", choices=["aga", "three_way"], default="aga",
                    help="aga: AGA's 2-way gate (baseline); three_way: Member 4's ThreeWayGate "
-                        "(history + present now, future branch once predictor features exist)")
+                        "over history, present and (with --future-encoder) future")
+    m.add_argument("--branches", default=",".join(BRANCHES),
+                   help="three_way only: comma-separated gate branches to keep, e.g. 'present' or "
+                        "'present,future'; the others get gate weight 0 (ablation)")
+    m.add_argument("--future-encoder", choices=["none", *FUTURE_ENCODERS], default="none",
+                   help="three_way only (Member 4): future branch from the V-JEPA predictor tokens. "
+                        "mean: mean of the 17 predictor-only tokens; probe: the predictor pathway of "
+                        "Member 2's STA factorized_pred probe (see --future-init)")
+    m.add_argument("--future-init", help="Member 2's STA factorized_pred probe checkpoint (best.pt) for "
+                                         "--future-encoder probe")
+    m.add_argument("--freeze-future", action="store_true", help="keep the initialised future probe fixed")
     t = p.add_argument_group("training")
     t.add_argument("--epochs", type=int, default=40)
     t.add_argument("--patience", type=int, default=8, help="stop after N epochs without improvement")
@@ -90,7 +108,36 @@ def parse_args(argv=None):
         p.error("--present-init / --freeze-present need --present-encoder probe")
     if a.freeze_present and not a.present_init:
         p.error("--freeze-present needs --present-init")
+    try:
+        branches = parse_branches(a.branches)
+    except ValueError as err:
+        p.error(str(err))
+    if a.fusion != "three_way" and (a.future_encoder != "none" or branches != BRANCHES):
+        p.error("--future-encoder / --branches need --fusion three_way")
+    if a.future_encoder != "none" and "future" not in branches:
+        p.error("--future-encoder is set but the future branch is switched off in --branches")
+    if a.future_encoder != "none" and a.no_anchor:
+        p.error("--future-encoder uses the predictor tokens of the exact STA clip; drop --no-anchor")
+    if (a.future_init or a.freeze_future) and a.future_encoder != "probe":
+        p.error("--future-init / --freeze-future need --future-encoder probe")
+    if a.freeze_future and not a.future_init:
+        p.error("--freeze-future needs --future-init")
     return a
+
+
+def parse_branches(text):
+    """'present,history' -> ('history', 'present'), in the gate's order; unknown names are an error."""
+    names = [b.strip() for b in text.split(",") if b.strip()]
+    if not names or set(names) - set(BRANCHES):
+        raise ValueError(f"--branches must be a non-empty subset of {','.join(BRANCHES)}, got '{text}'")
+    return tuple(b for b in BRANCHES if b in names)
+
+
+def has_future(src, event):
+    """Whether predictor tokens exist for this event (an all-zero block is caught later, per item)."""
+    if event.sta_cutoff < 0:
+        return False
+    return src.rows.get(event.narration_id) is not None if hasattr(src, "rows") else event.narration_id in src
 
 
 def manifest_events(path: Path) -> list[Event]:
@@ -193,12 +240,17 @@ def cold_start_scores(train, manifest_dir):
 
 
 def run_model(model, b, device):
-    """Forward pass for both present encoders (present tokens are only in the batch for 'probe')."""
+    """Forward pass for both present encoders (present tokens are only in the batch for 'probe';
+    future tokens only with Member 4's --future-encoder)."""
+    kw = {}
+    if "future_tokens" in b:
+        kw = {"future_tokens": b["future_tokens"].to(device, non_blocking=True),
+              "future_available": b["future_available"].to(device, non_blocking=True)}
     if "present_tokens" in b:
         return model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True),
                      b["present_tokens"].to(device, non_blocking=True),
-                     (b["present_source"] > 0).to(device, non_blocking=True))
-    return model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True))
+                     (b["present_source"] > 0).to(device, non_blocking=True), **kw)
+    return model(b["feats"].to(device, non_blocking=True), b["valid"].to(device, non_blocking=True), **kw)
 
 
 @torch.no_grad()
@@ -218,6 +270,8 @@ def predict(model, loader, device, prior_v, prior_n, extras=False):
             out["step_valid"].append(b["valid"].numpy())
             if "present_source" in b:
                 out["present_source"].append(b["present_source"].numpy())
+            if "future_available" in b:
+                out["future_available"].append(b["future_available"].numpy())
             for k in ("attn", "attn_verb", "attn_noun"):          # [B,H,S-1] -> mean over heads
                 if k in r:
                     out[k].append(r[k].mean(1).float().cpu().numpy())
@@ -266,6 +320,18 @@ def main(argv=None):
             bank = FeatureBank({k: v for k, v in bank.entries.items()}, pooled=True)
     T, D = bank.shape
     D = bank.token_shape[1]
+    future_src = None                   # Member 4: predictor tokens of the exact STA clip
+    if a.future_encoder != "none":
+        if a.features_dir:
+            future_src = Anchors(a.features_dir, tokens_file="sta_pred_tokens.npy")
+        else:                           # mock run: random predictor tokens from their own generator
+            g = torch.Generator().manual_seed(a.seed + 1)
+            future_src = {e.narration_id: torch.randn(*bank.token_shape, generator=g)
+                          for e in train + val + test if e.sta_cutoff >= 0}
+        missing = sum(e.sta_cutoff >= 0 and not has_future(future_src, e) for e in test)
+        if missing:
+            print(f"WARNING: {missing}/{len(test)} test events have no predictor tokens; the gate runs "
+                  "without the future branch for them.", flush=True)
     if anchors is not None and test:
         missing = sum(e.sta_cutoff >= 0 and anchors.rows.get(e.narration_id) is None for e in test)
         if missing:
@@ -282,7 +348,7 @@ def main(argv=None):
           f"mode {a.mode}, S={a.steps}, stride {a.stride}s, device {device}", flush=True)
 
     prior_v, prior_n, prior_source = cold_start_scores(train, a.manifest_dir)
-    kw_ds = dict(anchors=anchors, present_tokens=probe)
+    kw_ds = dict(anchors=anchors, present_tokens=probe, future=future_src)
     sets = {"train": HistoryDataset(train, bank, a.steps, a.stride, aux=AuxLabeler(train), **kw_ds),
             "val": HistoryDataset(val, bank, a.steps, a.stride, **kw_ds)}
     if test:
@@ -301,9 +367,20 @@ def main(argv=None):
         epoch0, score0 = model.load_present(a.present_init)
         present_init = {"path": a.present_init, "epoch": epoch0, "val_action_mt5r": score0}
         print(f"present probe initialised from {a.present_init} (its val action MT5R: {score0})", flush=True)
+    future_init = None
     if a.fusion == "three_way":
         from epic_starter.models.gate import GatedVerbNounHead   # Member 4
-        model = GatedAGAModel(model, GatedVerbNounHead(in_dim=a.d_model))
+        future_encoder = None
+        if a.future_encoder != "none":
+            from epic_starter.models.future_branch import FutureBranch
+            future_encoder = FutureBranch(D, a.d_model, encoder=a.future_encoder, freeze_probe=a.freeze_future)
+            if a.future_init:
+                epoch_f, score_f = future_encoder.load_probe(a.future_init)
+                future_init = {"path": a.future_init, "epoch": epoch_f, "val_action_mt5r": score_f}
+                print(f"future probe initialised from {a.future_init} (its val action MT5R: {score_f})",
+                      flush=True)
+        model = GatedAGAModel(model, GatedVerbNounHead(in_dim=a.d_model), future_encoder=future_encoder,
+                              branches=parse_branches(a.branches))
     model = model.to(device)
     wv, wn = class_weights(train, a.class_weights)
     wv, wn = (wv.to(device) if wv is not None else None), (wn.to(device) if wn is not None else None)
@@ -315,6 +392,9 @@ def main(argv=None):
               "feature_shape": [T, D], "events": {k: len(ds) for k, ds in sets.items()},
               "cold_start_events": {k: int(sum(e.sta_cutoff < 0 for e in ds.events)) for k, ds in sets.items()},
               "present_init": present_init, "cold_start_prior": prior_source,
+              "future_init": future_init,
+              "events_with_future": None if future_src is None else
+              {k: int(sum(has_future(future_src, e) for e in ds.events)) for k, ds in sets.items()},
               "torch": torch.__version__, "python": platform.python_version(),
               "parameters": sum(p.numel() for p in model.parameters()),
               "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)}
@@ -357,6 +437,7 @@ def main(argv=None):
         if score > best:
             best, best_epoch, waited = score, epoch, 0
             torch.save({"state_dict": model.state_dict(), "ctor": ctor, "fusion": a.fusion, "epoch": epoch,
+                        "branches": parse_branches(a.branches), "future_encoder": a.future_encoder,
                         "val_action_mt5r": score}, out / "best.pt")
         else:
             waited += 1
