@@ -13,10 +13,12 @@ if __package__:
     from .data.events import Event, Window, seconds, load_events, observation
     from .data.manifests import grouped_split, training_priors, video_index, manifest_record, prepare
     from .data.sampling import decode_window, sample_event
+    from .data.hybrid_split import prepare_hybrid
 else:
     from data.events import Event, Window, seconds, load_events, observation
     from data.manifests import grouped_split, training_priors, video_index, manifest_record, prepare
     from data.sampling import decode_window, sample_event
+    from data.hybrid_split import prepare_hybrid
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -30,6 +32,21 @@ def main():
     prep.add_argument("--val-fraction", type=float, default=.2)
     prep.add_argument("--context", type=float, default=5.)
     prep.add_argument("--allow-missing-videos", action="store_true")
+    hyb = sub.add_parser("prepare-hybrid", help="Member 1 hybrid seen/unseen split (no videos needed)")
+    hyb.add_argument("--train-csv", required=True)
+    hyb.add_argument("--test-csv")
+    hyb.add_argument("--out-dir", required=True)
+    hyb.add_argument("--unseen-participants", default="",
+                     help="Comma-separated IDs; empty = deterministic automatic choice")
+    hyb.add_argument("--unseen-fraction", type=float, default=.06)
+    hyb.add_argument("--seen-fraction", type=float, default=.08)
+    hyb.add_argument("--seen-max-fraction", type=float, default=.15)
+    hyb.add_argument("--context", type=float, default=5.)
+    feats = sub.add_parser("check-features", help="Reject feature banks whose STA clips pass the cutoff")
+    feats.add_argument("--feature-dir", required=True)
+    feats.add_argument("--train-csv", required=True)
+    feats.add_argument("--test-csv")
+    feats.add_argument("--partial", action="store_true", help="Allow events without features (dummy banks)")
     sample = sub.add_parser("sample")
     sample.add_argument("--csv", required=True)
     sample.add_argument("--unlabeled", action="store_true")
@@ -45,6 +62,24 @@ def main():
         result = prepare(args.train_csv, args.video_root, args.out_dir, args.test_csv,
                          args.seed, args.val_fraction, args.context, args.allow_missing_videos)
         print(json.dumps(result, indent=2))
+    elif args.command == "prepare-hybrid":
+        unseen = [p.strip() for p in args.unseen_participants.split(",") if p.strip()] or None
+        result = prepare_hybrid(args.train_csv, args.out_dir, args.test_csv, unseen,
+                                args.unseen_fraction, args.seen_fraction, args.seen_max_fraction,
+                                args.context)
+        print(json.dumps(result, indent=2))
+    elif args.command == "check-features":
+        import pandas as pd
+        if __package__:
+            from .leakage import check_event_features
+        else:
+            from leakage import check_event_features
+        events = load_events(Path(args.train_csv))
+        if args.test_csv:
+            events += load_events(Path(args.test_csv), labeled=False)
+        index = pd.read_csv(Path(args.feature_dir) / "events_index.csv")
+        check_event_features(index, events, require_all=not args.partial)
+        print(f"OK: {len(index)} feature rows, no STA clip ends after its cutoff")
     else:
         import numpy as np
         matches = [e for e in load_events(Path(args.csv), not args.unlabeled)

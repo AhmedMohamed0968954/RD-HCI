@@ -36,6 +36,23 @@ def rank5(values):
     # Stable ties: lower class ID wins. Joint IDs are verb * 300 + noun.
     return np.argsort(-values, axis=1, kind="stable")[:, :5]
 
+def action_top5(vp, np_, k=10):
+    """Top-5 (verb, noun) pairs of the joint score p_v * p_n, as IDs verb*300+noun.
+
+    Any pair in the joint top 5 has its verb in the verb top 5 and its noun in the
+    noun top 5 (otherwise five better pairs exist), so searching the top-k x top-k
+    grid with k >= 5 is exact. k=10 also absorbs near-ties. Ties break toward the
+    lower joint ID, matching a stable sort over all 29,100 pairs, but ~300x faster.
+    """
+    n = len(vp)
+    cv = np.argsort(-vp, axis=1, kind="stable")[:, :k]
+    cn = np.argsort(-np_, axis=1, kind="stable")[:, :k]
+    rows = np.arange(n)[:, None, None]
+    score = (vp[rows[:, :, 0], cv][:, :, None] * np_[rows[:, :, 0], cn][:, None, :]).reshape(n, -1)
+    ids = (cv[:, :, None] * 300 + cn[:, None, :]).reshape(n, -1)
+    order = np.lexsort((ids, -score), axis=1)[:, :5]
+    return np.take_along_axis(ids, order, axis=1)
+
 def scores_for(y, top):
     # Top-5 accuracy averages samples; MT5R averages per-class recalls with equal class weights.
     hit1 = top[:, 0] == y
@@ -58,10 +75,7 @@ def evaluate(verb_scores, noun_scores, verb_labels, noun_labels,
     av = yv * 300 + yn
     # An action is a (verb, noun) pair, not the average of two independent accuracies.
     topv, topn = rank5(vp), rank5(np_)
-    topa = np.empty((n, 5), dtype=np.int64)
-    for start in range(0, n, 64):
-        joint = (vp[start:start+64, :, None] * np_[start:start+64, None, :]).reshape(-1, 97 * 300)
-        topa[start:start+64] = rank5(joint)
+    topa = action_top5(vp, np_)
     masks = {"all": np.ones(n, dtype=bool)}
     for name, mask in (subsets or {}).items():
         mask = array(mask)
@@ -125,3 +139,54 @@ def save_submission(ar_predictions, sta_predictions, expected_ids, out_dir):
         for filename in filenames:
             archive.write(out / filename, arcname=filename)
     return out / "submission.zip"
+
+
+def evaluate_breakdown(verb_scores, noun_scores, verb_labels, noun_labels, task="AR",
+                       score_type="logits", unseen_mask=None, tail_verbs=(), tail_nouns=()):
+    """Overall / seen / unseen / tail table for the validation split.
+
+    Tail follows the EPIC-KITCHENS-100 style: verb metrics on events with a tail
+    verb, noun metrics on events with a tail noun, action metrics on events whose
+    verb OR noun is tail. Tail class lists must come from training counts
+    (``tail_classes.json``), never from validation labels.
+    """
+    vp = probabilities(verb_scores, 97, score_type)
+    np_ = probabilities(noun_scores, 300, score_type)
+    n = len(vp)
+    yv, yn = labels(verb_labels, n, 97), labels(noun_labels, n, 300)
+    ya = yv * 300 + yn
+    tops = {"verb": (yv, rank5(vp)), "noun": (yn, rank5(np_)), "action": (ya, action_top5(vp, np_))}
+    tv, tn = np.isin(yv, list(tail_verbs)), np.isin(yn, list(tail_nouns))
+    every = np.ones(n, dtype=bool)
+    groups = {"overall": {"verb": every, "noun": every, "action": every}}
+    if unseen_mask is not None:
+        u = array(unseen_mask).astype(bool)
+        if u.shape != (n,):
+            raise ValueError("unseen_mask must have one entry per event")
+        groups["unseen"] = {"verb": u, "noun": u, "action": u}
+        groups["seen"] = {"verb": ~u, "noun": ~u, "action": ~u}
+    if len(tail_verbs) or len(tail_nouns):
+        groups["tail"] = {"verb": tv, "noun": tn, "action": tv | tn}
+    primary = "action_top1" if task == "AR" else "action_mt5r"
+    result = {}
+    for name, masks in groups.items():
+        part = {}
+        for comp, (y, top) in tops.items():
+            m = masks[comp]
+            part[comp + "_events"] = int(m.sum())
+            if m.any():
+                part.update({comp + "_" + k: v for k, v in scores_for(y[m], top[m]).items()})
+        part["primary_metric"] = primary
+        part["primary_score"] = part.get(primary)
+        result[name] = part
+    return result
+
+
+def format_breakdown(result, keys=("verb_top1", "noun_top1", "action_top1", "verb_top5",
+                                   "noun_top5", "action_top5", "action_mt5r")):
+    """Plain-text table, ready for logs or slides."""
+    lines = ["subset    " + " ".join(f"{k:>12}" for k in keys)]
+    for name, part in result.items():
+        cells = [f"{part[k]:12.2f}" if part.get(k) is not None else f"{'-':>12}" for k in keys]
+        lines.append(f"{name:<9} " + " ".join(cells))
+    return "\n".join(lines)
