@@ -106,6 +106,36 @@ sbatch --array=4-7%3 -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-ablation-%A_%
 python scripts/report_sta_memory.py --runs-dir "$EPIC_TEAM/results/sta_memory" --out-dir report_sta
 ```
 
+### Memory pre-training (gate collapse, plan item 5)
+
+With a memory trained from scratch, the gates hand everything to the frozen probe within the first
+epochs (AGA gate ~0.07 for the history, three-way gate ≥ 0.98 on the present,
+docs/MEMBER4_GATE_ABLATION.md): the memory starts as noise while the probe has already converged.
+Pre-training gives the memory a head start:
+
+1. **Stage 1, memory only** (`--present-encoder none`): no probe and no gate. The verb/noun heads
+   read the retrieved history `h` directly, so the STA action has to be predicted from the past
+   steps' features (the query still sees the model's own prediction for the last step, as in AGA).
+   The auxiliary per-step loss is unchanged.
+2. **Stage 2, warm start** (`--memory-init <stage 1>/best.pt`): the usual model with Member 2's
+   frozen probe; the memory part (`fx`, `aux_verb` / `aux_noun`, `mem_v` / `mem_n`) is loaded
+   from stage 1, the gate and the correction head start fresh (correction = 0, so the score
+   before training is still the probe alone). `--freeze-memory` keeps the loaded memory fixed.
+   Works with both gates (`--fusion aga` and `three_way`).
+
+```bash
+# one job per seed: stage 1, then the stage-2 rows (see the script header for the comparisons)
+for s in 42 1 2; do
+  sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" scripts/sta_memory_pretrain.slurm $s
+done
+python scripts/member4_gate_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" \
+       --out "$EPIC_TEAM/results/sta_memory_pretrain.md"    # pre-trained rows next to the scratch rows
+```
+
+What answers the question: `_3way_warm` against `_3way_P` (history off) with the same seed, and
+the gate weights for history. Pre-trained runs get their own rows in both report scripts
+(`memory` column; `[memory pre-trained]` labels), so they are never averaged with scratch runs.
+
 Measured cost: data loading ~0.25 ms/event; with the probe ~1.4 s per batch of 256 on 2 cores,
 i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 `-p gpu_p100 --gpus-per-node=1` to `sbatch` and `export EPIC_GPU_ENV=<CUDA venv>`.
@@ -115,7 +145,7 @@ i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 | file | for whom | content |
 |---|---|---|
 | `metrics.json` | everyone | per-epoch scores (all / `unseen` / `tail` as Member 2), best epoch, Member 1's official breakdown |
-| `config.json` | report | arguments, git commit, feature `meta.json`, probe init, split sizes |
+| `config.json` | report | arguments, git commit, feature `meta.json`, probe and memory init, split sizes |
 | `best.pt` | Member 4 | weights + constructor arguments of the best epoch |
 | `val_outputs.npz` | Member 1 | raw verb/noun logits, labels, `use_prior`, prior, attention, gates, present source |
 | `test_outputs.npz` | Member 1 | raw hidden-test logits (calibrate, then package with AR) |

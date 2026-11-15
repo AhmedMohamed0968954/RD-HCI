@@ -10,6 +10,13 @@ Per field (verb / noun) a sigmoid gate mixes the retrieved history h with the pr
 (AGA's 2-way gate). The present is either the memory's last step (token mean) or Member 2's
 factorized probe on the full 24 tokens of the present clip (present_encoder="probe").
 `encode()` exposes h and e per field so GatedAGAModel can use Member 4's ThreeWayGate.
+
+Memory pre-training (two stages):
+  1. present_encoder="none": no present branch and no gate. The STA label is predicted from the
+     retrieved history h alone, so the memory has to learn to be useful on its own.
+  2. A probe model loads the memory part of that checkpoint (`load_memory`: the per-step feature
+     projection, the auxiliary heads and the AGA attention) and trains the gate and the correction
+     head on top of it, with the memory fine-tuned or frozen (freeze_memory=True).
 """
 from __future__ import annotations
 import torch
@@ -75,18 +82,24 @@ class AGAMemoryModel(nn.Module):
                              verb/noun logits are the base prediction and the memory adds a
                              correction (zero-initialised), so a probe initialised from Member 2's
                              checkpoint starts exactly at the probe's score.
+    present_encoder="none"   memory only (stage 1 of memory pre-training): no present branch and no
+                             gate; the verb/noun heads read the retrieved history h directly.
+    freeze_memory=True       keep the memory part (memory_parts()) fixed, e.g. after `load_memory`.
     """
 
     def __init__(self, feat_dim, d=256, heads=4, alpha=0.8, mode="decoupled", dropout=0.3,
-                 present_encoder="mean", freeze_present=False):
+                 present_encoder="mean", freeze_present=False, freeze_memory=False):
         super().__init__()
         if mode not in {"single", "decoupled"}:
             raise ValueError("mode must be single or decoupled")
-        if present_encoder not in {"mean", "probe"}:
-            raise ValueError("present_encoder must be mean or probe")
+        if present_encoder not in {"mean", "probe", "none"}:
+            raise ValueError("present_encoder must be mean, probe or none")
         if d % heads:
             raise ValueError("d must be divisible by heads")
         self.mode, self.present_encoder, self.freeze_present = mode, present_encoder, freeze_present
+        self.freeze_memory = freeze_memory
+        # what a memory checkpoint must match to be loaded into this model (load_memory)
+        self.memory_shape = {"feat_dim": feat_dim, "d": d, "heads": heads, "alpha": alpha, "mode": mode}
         self.pool = lambda x: x.mean(dim=2)                       # [B,S,T,D] -> [B,S,D]
         self.fx = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
         self.aux_verb, self.aux_noun = nn.Linear(d, N_VERB), nn.Linear(d, N_NOUN)
@@ -94,7 +107,8 @@ class AGAMemoryModel(nn.Module):
             self.mem = Memory(N_VERB + N_NOUN, d, heads, alpha)
         else:
             self.mem_v, self.mem_n = Memory(N_VERB, d, heads, alpha), Memory(N_NOUN, d, heads, alpha)
-        self.gate_v, self.gate_n = Gate(d), Gate(d)
+        if present_encoder != "none":
+            self.gate_v, self.gate_n = Gate(d), Gate(d)
         self.head_verb = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_VERB))
         self.head_noun = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_NOUN))
         if present_encoder == "probe":
@@ -107,12 +121,44 @@ class AGAMemoryModel(nn.Module):
                 nn.init.zeros_(head[-1].bias)
             if freeze_present:
                 self.present.requires_grad_(False)
+        if freeze_memory:
+            for part in self.memory_parts().values():
+                part.requires_grad_(False)
+
+    def memory_parts(self) -> dict[str, nn.Module]:
+        """The memory proper, shared by both pre-training stages: per-step feature projection,
+        auxiliary per-step heads (they produce the keys and the query) and the AGA attention.
+        Gates, heads and the present encoder are not part of it."""
+        names = ["fx", "aux_verb", "aux_noun"] + (["mem"] if self.mode == "single" else ["mem_v", "mem_n"])
+        return {n: getattr(self, n) for n in names}
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_present and self.present_encoder == "probe":
             self.present.eval()                                   # frozen probe: no dropout
+        if self.freeze_memory:
+            for part in self.memory_parts().values():
+                part.eval()                                       # frozen memory: no dropout
         return self
+
+    def load_memory(self, path, map_location="cpu"):
+        """Initialise the memory part from a train_sta_memory.py checkpoint (best.pt), normally a
+        memory-only run (stage 1). Also accepts a GatedAGAModel checkpoint ('memory.' prefix).
+        The feature size, d, heads, alpha and mode must match; S may differ (no weight depends on it).
+        Returns the source run's epoch, val action MT5R and present encoder."""
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        ctor = ckpt.get("ctor") or {}
+        diff = {k: (ctor.get(k), v) for k, v in self.memory_shape.items() if ctor.get(k) != v}
+        if diff:
+            raise ValueError(f"Memory checkpoint {path} does not match this model "
+                             f"(checkpoint, model): {diff}")
+        state = ckpt["state_dict"]
+        if any(k.startswith("memory.") for k in state):          # saved from GatedAGAModel
+            state = {k[len("memory."):]: v for k, v in state.items() if k.startswith("memory.")}
+        for name, part in self.memory_parts().items():
+            sub = {k[len(name) + 1:]: v for k, v in state.items() if k.startswith(name + ".")}
+            part.load_state_dict(sub)                             # strict: every weight must be there
+        return ckpt.get("epoch"), ckpt.get("val_action_mt5r"), ctor.get("present_encoder")
 
     def load_present(self, path, map_location="cpu"):
         """Initialise the present probe from Member 2's train_probe.py checkpoint (best.pt)."""
@@ -141,6 +187,9 @@ class AGAMemoryModel(nn.Module):
         z = {"history_available": valid[:, :-1].any(dim=1), "aux_verb_logits": aux_v, "aux_noun_logits": aux_n}
         if self.present_encoder == "mean":
             z.update(verb_present=e[:, -1], noun_present=e[:, -1], present_available=valid[:, -1])
+        elif self.present_encoder == "none":                       # memory only: no present branch
+            zeros = torch.zeros_like(e[:, -1])
+            z.update(verb_present=zeros, noun_present=zeros, present_available=torch.zeros_like(valid[:, -1]))
         else:
             if present_tokens is None or present_available is None:
                 raise ValueError("present_encoder='probe' needs present_tokens and present_available")
@@ -163,6 +212,10 @@ class AGAMemoryModel(nn.Module):
     def forward(self, feats, valid, present_tokens=None, present_available=None):
         z = self.encode(feats, valid, present_tokens, present_available)
         extra = {k: z[k] for k in ("attn", "attn_verb", "attn_noun") if k in z}
+        if self.present_encoder == "none":                       # stage 1: predict from history alone
+            return {"verb_logits": self.head_verb(z["verb_history"]),
+                    "noun_logits": self.head_noun(z["noun_history"]),
+                    "aux_verb_logits": z["aux_verb_logits"], "aux_noun_logits": z["aux_noun_logits"], **extra}
         ov, gv = self.gate_v(z["verb_history"], z["verb_present"])
         on, gn = self.gate_n(z["noun_history"], z["noun_present"])
         extra.update(gate_verb=gv, gate_noun=gn)
@@ -194,6 +247,8 @@ class GatedAGAModel(nn.Module):
         unknown = set(branches) - set(self.BRANCHES)
         if unknown or not branches:
             raise ValueError(f"branches must be a non-empty subset of {self.BRANCHES}, got {branches}")
+        if memory.present_encoder == "none":
+            raise ValueError("GatedAGAModel needs a present encoder (memory-only models have no present branch)")
         self.memory, self.head, self.future_encoder = memory, head, future_encoder
         self.branches = tuple(b for b in self.BRANCHES if b in branches)
         self.register_buffer("branch_mask", torch.tensor([b in branches for b in self.BRANCHES]),

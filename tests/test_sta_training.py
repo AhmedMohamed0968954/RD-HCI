@@ -186,3 +186,109 @@ def test_mean_present_ablation_runs(toy):
                     "--d-model", "16", "--heads", "2", "--num-workers", "0", "--device", "cpu"])
     assert 0 <= s["best_val_action_mt5r"] <= 100
     assert "present_source" not in np.load(out / "val_outputs.npz").files
+
+
+def probe_checkpoint(path, dim=16):
+    from epic_starter.models.factorized_probe import FactorizedAttentiveProbe
+    torch.manual_seed(0)
+    probe = FactorizedAttentiveProbe(embed_dim=dim, mode="factorized").eval()
+    torch.save({"model": probe.state_dict(), "mode": "factorized", "task": "STA", "epoch": 7,
+                "metrics": {"all": {"action_mt5r": 7.63}}}, path)
+    return probe
+
+
+def test_memory_pretraining_two_stages(toy, tmp_path):
+    """Stage 1 trains the memory alone; stage 2 starts the probe model from that memory."""
+    train = script("train_sta_memory")
+    feats = tmp_path / "f16"
+    write_mock_consolidated(load_events(toy / "train.csv"), feats, tokens=24, dim=16)
+    common = ["--train-csv", str(toy / "train.csv"), "--features-dir", str(feats), "--steps", "4",
+              "--d-model", "16", "--heads", "2", "--num-workers", "0", "--device", "cpu"]
+    runs = toy / "runs"
+    s1 = train.main(common + ["--present-encoder", "none", "--epochs", "2", "--out-dir", str(runs / "memonly")])
+    assert 0 <= s1["best_val_action_mt5r"] <= 100
+    stage1 = runs / "memonly" / "best.pt"
+    mem = torch.load(stage1)["state_dict"]
+    assert not any(k.startswith(("gate_", "present")) for k in mem)       # no gate, no probe
+    memory_keys = [k for k in mem if k.startswith(("fx.", "aux_verb.", "aux_noun.", "mem_v.", "mem_n."))]
+    assert memory_keys
+    ckpt = tmp_path / "probe.pt"
+    probe = probe_checkpoint(ckpt)
+    warm = ["--present-init", str(ckpt), "--freeze-present", "--memory-init", str(stage1)]
+
+    # frozen memory: it ends exactly as stage 1 left it, and the probe is untouched
+    train.main(common + warm + ["--freeze-memory", "--epochs", "2", "--out-dir", str(runs / "warm_frozen")])
+    got = torch.load(runs / "warm_frozen" / "best.pt")["state_dict"]
+    for k in memory_keys:
+        assert torch.equal(got[k], mem[k]), k
+    for k, v in probe.state_dict().items():
+        assert torch.equal(got[f"present.{k}"], v), k
+    cfg = json.loads((runs / "warm_frozen" / "config.json").read_text())
+    assert cfg["memory_init"]["source_present_encoder"] == "none" and cfg["memory_init"]["frozen"]
+    # the correction still starts at zero, so the score before training is the probe alone
+    assert json.loads((runs / "warm_frozen" / "metrics.json").read_text())["init"]["probe_alone"]
+
+    # fine-tuned memory, with the AGA gate and with Member 4's three-way gate
+    train.main(common + warm + ["--epochs", "1", "--out-dir", str(runs / "warm")])
+    train.main(common + warm + ["--fusion", "three_way", "--epochs", "1", "--out-dir", str(runs / "3way_warm")])
+    cfg_ft = json.loads((runs / "warm" / "config.json").read_text())
+    assert cfg_ft["trainable_parameters"] - cfg["trainable_parameters"] == cfg["memory_init"]["parameters"]
+
+    # the report keeps pre-trained runs apart from scratch runs
+    script("report_sta_memory").main(["--runs-dir", str(runs), "--out-dir", str(tmp_path / "rep")])
+    table = (tmp_path / "rep" / "results.md").read_text()
+    assert "none (memory only)" in table and ", pre-trained (frozen)" in table and ", pre-trained |" in table
+    rows = script("member4_gate_summary").main(["--runs-dir", str(runs), "--steps", "4",
+                                                "--out", str(tmp_path / "gate.md")])
+    labels = {r["label"] for r in rows}
+    assert {"aga [memory pre-trained]", "aga [memory pre-trained (frozen)]",
+            "three_way H+P [memory pre-trained]"} <= labels
+
+
+def test_load_memory_checks_shapes_and_reads_gated_checkpoints(tmp_path):
+    from epic_starter.models.aga import AGAMemoryModel, GatedAGAModel
+    from epic_starter.models.gate import GatedVerbNounHead
+    torch.manual_seed(1)
+    src = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="none")
+    ctor = dict(feat_dim=16, d=16, heads=2, alpha=0.8, mode="decoupled", present_encoder="none")
+    torch.save({"state_dict": src.state_dict(), "ctor": ctor, "epoch": 3, "val_action_mt5r": 5.0},
+               tmp_path / "memonly.pt")
+    dst = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="probe")
+    assert dst.load_memory(tmp_path / "memonly.pt") == (3, 5.0, "none")
+    for name, part in src.memory_parts().items():
+        for k, v in part.state_dict().items():
+            assert torch.equal(dst.memory_parts()[name].state_dict()[k], v), f"{name}.{k}"
+    # a three-way (GatedAGAModel) checkpoint stores the memory under 'memory.'
+    gated = GatedAGAModel(dst, GatedVerbNounHead(in_dim=16))
+    torch.save({"state_dict": gated.state_dict(), "ctor": {**ctor, "present_encoder": "probe"}},
+               tmp_path / "gated.pt")
+    again = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="mean")
+    again.load_memory(tmp_path / "gated.pt")
+    assert torch.equal(again.fx[-1].weight, src.fx[-1].weight)
+    with pytest.raises(ValueError, match="does not match"):
+        AGAMemoryModel(feat_dim=16, d=32, heads=2, present_encoder="probe").load_memory(tmp_path / "memonly.pt")
+    with pytest.raises(ValueError, match="does not match"):
+        AGAMemoryModel(feat_dim=16, d=16, heads=2, mode="single").load_memory(tmp_path / "memonly.pt")
+    with pytest.raises(ValueError):
+        GatedAGAModel(src, GatedVerbNounHead(in_dim=16))       # memory only has no present branch
+
+
+def test_memory_only_ignores_the_present_and_frozen_memory_has_no_dropout():
+    from epic_starter.models.aga import AGAMemoryModel
+    torch.manual_seed(2)
+    model = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="none", dropout=0.5).eval()
+    feats, valid = torch.randn(4, 5, 1, 16), torch.ones(4, 5, dtype=torch.bool)
+    out = model(feats, valid)
+    assert out["verb_logits"].shape == (4, 97) and out["noun_logits"].shape == (4, 300)
+    assert "gate_verb" not in out
+    frozen = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="mean", freeze_memory=True).train()
+    assert all(not p.requires_grad for part in frozen.memory_parts().values() for p in part.parameters())
+    assert all(not m.training for part in frozen.memory_parts().values() for m in part.modules())
+    assert frozen.gate_v.training and any(p.requires_grad for p in frozen.gate_v.parameters())
+
+
+@pytest.mark.parametrize("bad", [["--freeze-memory"], ["--present-encoder", "none", "--memory-init", "x.pt"],
+                                 ["--present-encoder", "none", "--fusion", "three_way"]])
+def test_pretraining_options_are_checked(bad):
+    with pytest.raises(SystemExit):
+        script("train_sta_memory").parse_args(["--train-csv", "x.csv", "--out-dir", "o"] + bad)

@@ -22,6 +22,12 @@ exact STA clip, sta_pred_tokens.npy) and switch gate branches off for ablations:
     python scripts/train_sta_memory.py --features-dir "$EPIC_FEATURES" \
         --manifest-dir "$EPIC_MANIFESTS" --test-csv "$EPIC_PROJECT/annotations/EPIC_100_test.csv" \
         --out-dir "$EPIC_TEAM/results/sta_memory/decoupled_S16_seed42" --mode decoupled --steps 16
+
+Memory pre-training (scripts/sta_memory_pretrain.slurm runs both stages):
+    stage 1  --present-encoder none                      memory only: predicts the STA action from
+                                                          the retrieved history, no probe, no gate
+    stage 2  --present-init <probe> --freeze-present --memory-init <stage 1>/best.pt [--freeze-memory]
+                                                          the probe model starts from that memory
 """
 from __future__ import annotations
 import argparse
@@ -69,11 +75,16 @@ def parse_args(argv=None):
     m.add_argument("--heads", type=int, default=8)
     m.add_argument("--alpha", type=float, default=0.8, help="EMA weight of the newest prediction")
     m.add_argument("--dropout", type=float, default=0.5)
-    m.add_argument("--present-encoder", choices=["probe", "mean"], default="probe",
+    m.add_argument("--present-encoder", choices=["probe", "mean", "none"], default="probe",
                    help="probe: Member 2's factorized probe on the present clip's 24 tokens (default); "
-                        "mean: the memory's own token-mean embedding of the last step (ablation)")
+                        "mean: the memory's own token-mean embedding of the last step (ablation); "
+                        "none: memory only, predicts from the retrieved history (memory pre-training, "
+                        "stage 1)")
     m.add_argument("--present-init", help="Member 2's STA factorized probe checkpoint (best.pt) to start from")
     m.add_argument("--freeze-present", action="store_true", help="keep the initialised probe fixed")
+    m.add_argument("--memory-init", help="best.pt of an earlier run (normally --present-encoder none) whose "
+                                         "memory part initialises this model (memory pre-training, stage 2)")
+    m.add_argument("--freeze-memory", action="store_true", help="keep the initialised memory fixed")
     m.add_argument("--fusion", choices=["aga", "three_way"], default="aga",
                    help="aga: AGA's 2-way gate (baseline); three_way: Member 4's ThreeWayGate "
                         "over history, present and (with --future-encoder) future")
@@ -108,6 +119,12 @@ def parse_args(argv=None):
         p.error("--present-init / --freeze-present need --present-encoder probe")
     if a.freeze_present and not a.present_init:
         p.error("--freeze-present needs --present-init")
+    if a.freeze_memory and not a.memory_init:
+        p.error("--freeze-memory needs --memory-init")
+    if a.memory_init and a.present_encoder == "none":
+        p.error("--memory-init is for stage 2 (a model with a present encoder); stage 1 starts from scratch")
+    if a.present_encoder == "none" and a.fusion != "aga":
+        p.error("--present-encoder none has no present branch to fuse; use --fusion aga")
     try:
         branches = parse_branches(a.branches)
     except ValueError as err:
@@ -360,13 +377,23 @@ def main(argv=None):
     masks = subsets(val, train)
 
     ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout,
-                present_encoder=a.present_encoder, freeze_present=a.freeze_present)
+                present_encoder=a.present_encoder, freeze_present=a.freeze_present,
+                freeze_memory=a.freeze_memory)
     model = AGAMemoryModel(**ctor)
     present_init = None
     if a.present_init:
         epoch0, score0 = model.load_present(a.present_init)
         present_init = {"path": a.present_init, "epoch": epoch0, "val_action_mt5r": score0}
         print(f"present probe initialised from {a.present_init} (its val action MT5R: {score0})", flush=True)
+    memory_init = None
+    if a.memory_init:                   # stage 2 of memory pre-training
+        epoch_m, score_m, source = model.load_memory(a.memory_init)
+        memory_init = {"path": a.memory_init, "epoch": epoch_m, "val_action_mt5r": score_m,
+                       "source_present_encoder": source, "frozen": a.freeze_memory,
+                       "parameters": sum(p.numel() for part in model.memory_parts().values()
+                                         for p in part.parameters())}
+        print(f"memory initialised from {a.memory_init} ({source} run, epoch {epoch_m}, its val action "
+              f"MT5R: {score_m}){', frozen' if a.freeze_memory else ''}", flush=True)
     future_init = None
     if a.fusion == "three_way":
         from epic_starter.models.gate import GatedVerbNounHead   # Member 4
@@ -392,7 +419,7 @@ def main(argv=None):
               "feature_shape": [T, D], "events": {k: len(ds) for k, ds in sets.items()},
               "cold_start_events": {k: int(sum(e.sta_cutoff < 0 for e in ds.events)) for k, ds in sets.items()},
               "present_init": present_init, "cold_start_prior": prior_source,
-              "future_init": future_init,
+              "future_init": future_init, "memory_init": memory_init,
               "events_with_future": None if future_src is None else
               {k: int(sum(has_future(future_src, e) for e in ds.events)) for k, ds in sets.items()},
               "torch": torch.__version__, "python": platform.python_version(),
