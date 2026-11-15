@@ -85,6 +85,9 @@ def parse_args(argv=None):
     m.add_argument("--memory-init", help="best.pt of an earlier run (normally --present-encoder none) whose "
                                          "memory part initialises this model (memory pre-training, stage 2)")
     m.add_argument("--freeze-memory", action="store_true", help="keep the initialised memory fixed")
+    m.add_argument("--step-features", help="folder from scripts/precompute_probe_steps.py: every memory step is "
+                                           "Member 2's frozen probe on that second's clip (verb/noun embeddings "
+                                           "as values, its predictions as keys) instead of the token mean")
     m.add_argument("--fusion", choices=["aga", "three_way"], default="aga",
                    help="aga: AGA's 2-way gate (baseline); three_way: Member 4's ThreeWayGate "
                         "over history, present and (with --future-encoder) future")
@@ -125,6 +128,8 @@ def parse_args(argv=None):
         p.error("--memory-init is for stage 2 (a model with a present encoder); stage 1 starts from scratch")
     if a.present_encoder == "none" and a.fusion != "aga":
         p.error("--present-encoder none has no present branch to fuse; use --fusion aga")
+    if a.step_features and (a.mode != "decoupled" or not a.features_dir):
+        p.error("--step-features needs --mode decoupled and the --features-dir it was computed from")
     try:
         branches = parse_branches(a.branches)
     except ValueError as err:
@@ -256,6 +261,25 @@ def cold_start_scores(train, manifest_dir):
     return np.log(prior["verb_output"]), np.log(prior["noun_output"]), source
 
 
+def load_step_features(a):
+    """The probe-steps folder (probe_steps.py), checked against this run's features and probe."""
+    from epic_starter.memory.probe_steps import same_file
+    bank = FeatureBank(root=a.step_features)                    # [M, 1, 2E+397], memory-mapped
+    meta = bank.meta
+    if meta.get("step_features") != "member2_sta_probe":
+        raise ValueError(f"{a.step_features} is not a probe-steps folder (scripts/precompute_probe_steps.py)")
+    if not same_file(meta.get("source_bank"), Path(a.features_dir) / "bank_tokens.npy"):
+        raise ValueError(f"{a.step_features} was computed from another bank_tokens.npy than {a.features_dir}")
+    if a.present_init and not same_file(meta.get("probe_checkpoint"), a.present_init):
+        raise ValueError(f"{a.step_features} was computed with another probe checkpoint than --present-init "
+                         f"{a.present_init}; regenerate it with scripts/precompute_probe_steps.py")
+    info = {"dir": a.step_features, "probe_checkpoint": meta.get("probe_checkpoint"),
+            "source_bank": meta.get("source_bank")}
+    print(f"memory steps: Member 2's probe outputs from {a.step_features} "
+          f"(probe {meta.get('probe_checkpoint', {}).get('path')})", flush=True)
+    return bank, info
+
+
 def run_model(model, b, device):
     """Forward pass for both present encoders (present tokens are only in the batch for 'probe';
     future tokens only with Member 4's --future-encoder)."""
@@ -325,11 +349,17 @@ def main(argv=None):
     train, val, test = load_splits(a)
     pooled = not a.no_pool
     probe = a.present_encoder == "probe"
+    step_bank = step_anchors = step_info = None
+    if a.step_features:                 # memory steps = Member 2's probe outputs per clip
+        step_bank, step_info = load_step_features(a)
+        step_anchors = None if a.no_anchor else Anchors(a.step_features)
+        pooled = False                  # the token bank is then only read for the present clip
     if a.features_dir:
         bank = FeatureBank(root=a.features_dir, pooled=pooled, cache_dir=a.pool_cache)
         # the probe needs all 24 tokens of the exact STA clip; the memory uses their mean
-        anchors = None if a.no_anchor else Anchors(a.features_dir, pooled=pooled and not probe,
-                                                   cache_dir=a.pool_cache)
+        anchors = None
+        if not a.no_anchor and (probe or step_bank is None):
+            anchors = Anchors(a.features_dir, pooled=pooled and not probe, cache_dir=a.pool_cache)
     else:
         print("WARNING: no --features-dir, using random MOCK features (pipeline test only)")
         bank, anchors = make_mock_bank(train + val + test, tokens=24, dim=64, encode_time=False), None
@@ -365,7 +395,8 @@ def main(argv=None):
           f"mode {a.mode}, S={a.steps}, stride {a.stride}s, device {device}", flush=True)
 
     prior_v, prior_n, prior_source = cold_start_scores(train, a.manifest_dir)
-    kw_ds = dict(anchors=anchors, present_tokens=probe, future=future_src)
+    kw_ds = dict(anchors=anchors, present_tokens=probe, future=future_src, step_bank=step_bank,
+                 step_anchors=step_anchors)
     sets = {"train": HistoryDataset(train, bank, a.steps, a.stride, aux=AuxLabeler(train), **kw_ds),
             "val": HistoryDataset(val, bank, a.steps, a.stride, **kw_ds)}
     if test:
@@ -378,7 +409,7 @@ def main(argv=None):
 
     ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout,
                 present_encoder=a.present_encoder, freeze_present=a.freeze_present,
-                freeze_memory=a.freeze_memory)
+                freeze_memory=a.freeze_memory, step_encoder="probe" if step_bank is not None else "mean")
     model = AGAMemoryModel(**ctor)
     present_init = None
     if a.present_init:
@@ -419,7 +450,7 @@ def main(argv=None):
               "feature_shape": [T, D], "events": {k: len(ds) for k, ds in sets.items()},
               "cold_start_events": {k: int(sum(e.sta_cutoff < 0 for e in ds.events)) for k, ds in sets.items()},
               "present_init": present_init, "cold_start_prior": prior_source,
-              "future_init": future_init, "memory_init": memory_init,
+              "future_init": future_init, "memory_init": memory_init, "step_features": step_info,
               "events_with_future": None if future_src is None else
               {k: int(sum(has_future(future_src, e) for e in ds.events)) for k, ds in sets.items()},
               "torch": torch.__version__, "python": platform.python_version(),

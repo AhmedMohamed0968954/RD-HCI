@@ -292,3 +292,83 @@ def test_memory_only_ignores_the_present_and_frozen_memory_has_no_dropout():
 def test_pretraining_options_are_checked(bad):
     with pytest.raises(SystemExit):
         script("train_sta_memory").parse_args(["--train-csv", "x.csv", "--out-dir", "o"] + bad)
+
+
+def test_probe_steps_precompute_loader_and_training(toy, tmp_path):
+    """Member 2's probe outputs per clip as memory steps: precompute, load, train both stages."""
+    from epic_starter.memory import HistoryDataset, make_mock_bank
+    from epic_starter.memory.probe_steps import encode, layout, precompute, step_dim
+    from epic_starter.models.aga import AGAMemoryModel
+    events = load_events(toy / "train.csv")
+    feats = tmp_path / "f16"
+    write_mock_consolidated(events, feats, tokens=24, dim=16)
+    ckpt = tmp_path / "probe.pt"
+    probe = probe_checkpoint(ckpt)
+    steps = precompute(feats, ckpt, tmp_path / "psteps", batch_size=64, log=lambda m: None)
+    src, out = np.load(feats / "bank_tokens.npy"), np.load(steps / "bank_tokens.npy")
+    assert out.shape == (len(src), 1, step_dim(16))
+    with torch.no_grad():
+        ref = probe(torch.from_numpy(src[:10].astype(np.float32)))
+    L = layout(16)
+    assert np.allclose(out[:10, 0, slice(*L["verb_logits"])], ref["verb_output"].numpy(), atol=2e-2)
+    assert np.allclose(out[:10, 0, slice(*L["noun_logits"])], ref["noun_output"].numpy(), atol=2e-2)
+    assert precompute(feats, ckpt, steps, log=lambda m: None) == steps             # same probe: no-op
+    other = tmp_path / "other.pt"
+    torch.save({**torch.load(ckpt), "note": "retrained"}, other)
+    with pytest.raises(FileExistsError):
+        precompute(feats, other, steps, log=lambda m: None)
+
+    # loader: steps from the probe bank, present clip from the token bank, same clips
+    bank, sbank = FeatureBank(root=feats), FeatureBank(root=steps)
+    ds = HistoryDataset(events[:20], bank, steps=4, anchors=Anchors(feats), present_tokens=True,
+                        step_bank=sbank, step_anchors=Anchors(steps))
+    item = ds[10]
+    assert item["feats"].shape == (4, 1, step_dim(16)) and int(item["present_source"]) == 1
+    # the last step is the probe on the same exact STA clip that the present branch reads
+    assert torch.allclose(item["feats"][-1, 0].float(), encode(probe, item["present_tokens"][None])[0],
+                          atol=2e-2)
+    with pytest.raises(ValueError, match="disagree"):
+        HistoryDataset(events[:20], bank, steps=4, step_bank=make_mock_bank(events, stride=0.5, dim=16))
+
+    # both pre-training stages on probe steps
+    train = script("train_sta_memory")
+    common = ["--train-csv", str(toy / "train.csv"), "--features-dir", str(feats), "--step-features", str(steps),
+              "--steps", "4", "--d-model", "16", "--heads", "2", "--num-workers", "0", "--device", "cpu"]
+    runs = toy / "runs"
+    train.main(common + ["--present-encoder", "none", "--epochs", "2", "--out-dir", str(runs / "ps_memonly")])
+    warm = ["--present-init", str(ckpt), "--freeze-present", "--memory-init", str(runs / "ps_memonly" / "best.pt")]
+    train.main(common + warm + ["--epochs", "1", "--out-dir", str(runs / "ps_warm")])
+    train.main(common + warm + ["--fusion", "three_way", "--epochs", "1", "--out-dir", str(runs / "ps_3way_warm")])
+    cfg = json.loads((runs / "ps_warm" / "config.json").read_text())
+    assert cfg["step_features"]["dir"] == str(steps)
+    assert json.loads((runs / "ps_warm" / "metrics.json").read_text())["init"]["probe_alone"]
+    # token-mean and probe-step memories are not interchangeable
+    with pytest.raises(ValueError, match="does not match"):
+        AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="probe").load_memory(runs / "ps_memonly" / "best.pt")
+    # steps computed with another probe than the present one are refused
+    with pytest.raises(ValueError, match="another probe checkpoint"):
+        train.main(common + ["--present-init", str(other), "--epochs", "1", "--out-dir", str(runs / "bad")])
+    rows = script("member4_gate_summary").main(["--runs-dir", str(runs), "--steps", "4",
+                                                "--out", str(tmp_path / "gate.md")])
+    assert {"aga [memory probe steps, pre-trained]", "three_way H+P [memory probe steps, pre-trained]"} <= \
+           {r["label"] for r in rows}
+
+
+def test_probe_steps_keys_are_the_probe_predictions():
+    from epic_starter.memory.probe_steps import layout, step_dim
+    from epic_starter.models.aga import AGAMemoryModel
+    torch.manual_seed(3)
+    with pytest.raises(ValueError):
+        AGAMemoryModel(feat_dim=16, d=16, heads=2, mode="single", step_encoder="probe")
+    model = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="none", step_encoder="probe").eval()
+    x = torch.randn(2, 5, 1, step_dim(16))
+    valid = torch.ones(2, 5, dtype=torch.bool)
+    base = model(x, valid)
+    # changing only the stored noun logits changes the noun memory's attention, not the verb memory's
+    y = x.clone()
+    y[..., slice(*layout(16)["noun_logits"])] = torch.randn(2, 5, 1, 300) * 5
+    moved = model(y, valid)
+    assert torch.allclose(base["attn_verb"], moved["attn_verb"])
+    assert not torch.allclose(base["attn_noun"], moved["attn_noun"])
+    with pytest.raises(ValueError, match="probe steps"):
+        model(torch.randn(2, 5, 1, 16), valid)

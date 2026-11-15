@@ -24,17 +24,32 @@
 #   for s in 42 1 2; do
 #     sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" scripts/sta_memory_pretrain.slurm $s
 #   done
+# Second argument "probe": the same rows with Member 2's probe outputs as memory steps
+# (--step-features "$EPIC_PROBE_STEPS", run names with _psteps), plus decoupled_S16_seed<N>_psteps
+# (memory from scratch on probe steps). Needs scripts/precompute_probe_steps.slurm first:
+#   J=$(sbatch --parsable -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/probe-steps-%j.out" scripts/precompute_probe_steps.slurm)
+#   for s in 42 1 2; do sbatch --dependency=afterok:${J%%;*} -A "$EPIC_ACCOUNT" \
+#     -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" scripts/sta_memory_pretrain.slurm $s probe; done
 # Then: python scripts/member4_gate_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" --out ...
 # Other split: sbatch --export=ALL,EPIC_MANIFESTS=<dir>,STA_RESULTS=<new results dir> ... (on wICE,
 # variables set in front of sbatch are not passed on; --export=ALL,... is).
 set -euo pipefail
 SEED="${1:-42}"
+STEPS="${2:-mean}"
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "seed must be an integer, got '$SEED'"; exit 1; }
+[[ "$STEPS" == mean || "$STEPS" == probe ]] || { echo "second argument must be mean or probe, got '$STEPS'"; exit 1; }
 source scripts/sta_memory_env.sh
 RESULTS="${STA_RESULTS:-$EPIC_TEAM/results/sta_memory}"
 FUTURE_CKPT="${EPIC_FUTURE_CKPT:-$EPIC_TEAM/results/member2_probe_full/STA_factorized_pred/best.pt}"
 BASE="decoupled_S16_seed${SEED}"
 if [[ ! -f "$EPIC_PROBE_CKPT" ]]; then echo "Missing $EPIC_PROBE_CKPT (Member 2's STA probe)"; exit 1; fi
+STEP_ARGS=()
+if [[ "$STEPS" == probe ]]; then
+    [[ -f "$EPIC_PROBE_STEPS/meta.json" ]] || {
+        echo "Missing $EPIC_PROBE_STEPS (run scripts/precompute_probe_steps.slurm first)"; exit 1; }
+    STEP_ARGS=(--step-features "$EPIC_PROBE_STEPS")
+    BASE="${BASE}_psteps"
+fi
 
 run() {   # run NAME [train_sta_memory.py arguments...]; same restart rules as sta_memory_ablation.slurm
     local name="$1"; shift
@@ -50,9 +65,12 @@ run() {   # run NAME [train_sta_memory.py arguments...]; same restart rules as s
     python scripts/train_sta_memory.py \
         --features-dir "$EPIC_FEATURES" --manifest-dir "$EPIC_MANIFESTS" "${STA_TEST_ARGS[@]}" \
         --pool-cache "$EPIC_TEAM/cache" --num-workers 4 \
-        --mode decoupled --steps 16 --seed "$SEED" "$@" --out-dir "$out"
+        --mode decoupled --steps 16 --seed "$SEED" "${STEP_ARGS[@]}" "$@" --out-dir "$out"
 }
 
+if [[ "$STEPS" == probe ]]; then        # memory from scratch on probe steps: separates steps from pre-training
+    run "$BASE" --present-init "$EPIC_PROBE_CKPT" --freeze-present
+fi
 run "${BASE}_memonly" --present-encoder none
 MEMORY="$RESULTS/${BASE}_memonly/best.pt"
 WARM=(--present-init "$EPIC_PROBE_CKPT" --freeze-present --memory-init "$MEMORY")

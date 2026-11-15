@@ -136,6 +136,35 @@ What answers the question: `_3way_warm` against `_3way_P` (history off) with the
 the gate weights for history. Pre-trained runs get their own rows in both report scripts
 (`memory` column; `[memory pre-trained]` labels), so they are never averaged with scratch runs.
 
+First results (split_seed42, 3 seeds): AGA gate 8.09 → **8.28 ± 0.11** with the pre-trained memory
+(8.27 frozen), history share of the gate 0.09 → ~0.5; three-way H+P 8.00 → 8.18 (noun gate then
+selects the history, 0.99). Details: project doc `member3_sta_memory_results.md`.
+
+### Probe outputs as memory steps (`--step-features`)
+
+The memory summarised each past second by its token mean, while the present clip goes through
+Member 2's probe. Since that probe is frozen, `scripts/precompute_probe_steps.slurm` runs it once over
+all 360k bank clips and the STA clips (`epic_starter/memory/probe_steps.py`, ~1.8 GB, same rows and
+times as the feature folder). With `--step-features "$EPIC_PROBE_STEPS"` each memory step is then
+Member 2's probe on that second's clip: the verb memory's **values** are the probe's verb embeddings
+and its **keys** the probe's verb probabilities (AGA's "the model's own predictions" with the strong
+model), likewise for nouns; the auxiliary heads stay as a training signal. Training reads the stored
+rows, so it is as fast as before. The run refuses step features computed from another feature bank or
+with another probe than `--present-init` (regenerate after Member 2 retrains the probe).
+
+```bash
+J=$(sbatch --parsable -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/probe-steps-%j.out" scripts/precompute_probe_steps.slurm)
+for s in 42 1 2; do
+  sbatch --dependency=afterok:${J%%;*} -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" \
+         scripts/sta_memory_pretrain.slurm $s probe
+done
+```
+
+Run names get `_psteps` (e.g. `decoupled_S16_seed42_psteps_warm`); `decoupled_S16_seed<N>_psteps` is the
+memory from scratch on probe steps, which separates the effect of the steps from pre-training. Caveat:
+the probe was trained on the training events, so its predictions (keys) are more confident on training
+clips than on validation clips; the present branch has the same property.
+
 Measured cost: data loading ~0.25 ms/event; with the probe ~1.4 s per batch of 256 on 2 cores,
 i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 `-p gpu_p100 --gpus-per-node=1` to `sbatch` and `export EPIC_GPU_ENV=<CUDA venv>`.

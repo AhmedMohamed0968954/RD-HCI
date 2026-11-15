@@ -11,6 +11,14 @@ Per field (verb / noun) a sigmoid gate mixes the retrieved history h with the pr
 factorized probe on the full 24 tokens of the present clip (present_encoder="probe").
 `encode()` exposes h and e per field so GatedAGAModel can use Member 4's ThreeWayGate.
 
+Memory steps (step_encoder):
+  "mean"   each past second is the mean of its V-JEPA tokens; an auxiliary per-step head predicts
+           verb/noun probabilities, which serve as keys and query.
+  "probe"  each past second is Member 2's frozen probe on that second's clip (precomputed,
+           epic_starter/memory/probe_steps.py): the verb memory's values are the probe's verb
+           embeddings and its keys the probe's verb probabilities, likewise for nouns. The
+           auxiliary heads stay (same training signal), but no longer produce the keys.
+
 Memory pre-training (two stages):
   1. present_encoder="none": no present branch and no gate. The STA label is predicted from the
      retrieved history h alone, so the memory has to learn to be useful on its own.
@@ -88,20 +96,31 @@ class AGAMemoryModel(nn.Module):
     """
 
     def __init__(self, feat_dim, d=256, heads=4, alpha=0.8, mode="decoupled", dropout=0.3,
-                 present_encoder="mean", freeze_present=False, freeze_memory=False):
+                 present_encoder="mean", freeze_present=False, freeze_memory=False, step_encoder="mean"):
         super().__init__()
         if mode not in {"single", "decoupled"}:
             raise ValueError("mode must be single or decoupled")
         if present_encoder not in {"mean", "probe", "none"}:
             raise ValueError("present_encoder must be mean, probe or none")
+        if step_encoder not in {"mean", "probe"}:
+            raise ValueError("step_encoder must be mean or probe")
+        if step_encoder == "probe" and mode != "decoupled":
+            raise ValueError("step_encoder='probe' has separate verb/noun steps: use mode='decoupled'")
         if d % heads:
             raise ValueError("d must be divisible by heads")
         self.mode, self.present_encoder, self.freeze_present = mode, present_encoder, freeze_present
-        self.freeze_memory = freeze_memory
+        self.freeze_memory, self.step_encoder = freeze_memory, step_encoder
         # what a memory checkpoint must match to be loaded into this model (load_memory)
-        self.memory_shape = {"feat_dim": feat_dim, "d": d, "heads": heads, "alpha": alpha, "mode": mode}
+        self.memory_shape = {"feat_dim": feat_dim, "d": d, "heads": heads, "alpha": alpha, "mode": mode,
+                             "step_encoder": step_encoder}
         self.pool = lambda x: x.mean(dim=2)                       # [B,S,T,D] -> [B,S,D]
-        self.fx = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
+        if step_encoder == "mean":
+            self.fx = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
+        else:                                                     # probe outputs per step
+            from epic_starter.memory.probe_steps import layout, step_dim
+            self.step_layout, self.step_dim = layout(feat_dim), step_dim(feat_dim)
+            self.fv = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
+            self.fn = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
         self.aux_verb, self.aux_noun = nn.Linear(d, N_VERB), nn.Linear(d, N_NOUN)
         if mode == "single":
             self.mem = Memory(N_VERB + N_NOUN, d, heads, alpha)
@@ -129,7 +148,8 @@ class AGAMemoryModel(nn.Module):
         """The memory proper, shared by both pre-training stages: per-step feature projection,
         auxiliary per-step heads (they produce the keys and the query) and the AGA attention.
         Gates, heads and the present encoder are not part of it."""
-        names = ["fx", "aux_verb", "aux_noun"] + (["mem"] if self.mode == "single" else ["mem_v", "mem_n"])
+        names = (["fx"] if self.step_encoder == "mean" else ["fv", "fn"]) + ["aux_verb", "aux_noun"]
+        names += ["mem"] if self.mode == "single" else ["mem_v", "mem_n"]
         return {n: getattr(self, n) for n in names}
 
     def train(self, mode: bool = True):
@@ -147,7 +167,7 @@ class AGAMemoryModel(nn.Module):
         The feature size, d, heads, alpha and mode must match; S may differ (no weight depends on it).
         Returns the source run's epoch, val action MT5R and present encoder."""
         ckpt = torch.load(path, map_location=map_location, weights_only=False)
-        ctor = ckpt.get("ctor") or {}
+        ctor = {"step_encoder": "mean", **(ckpt.get("ctor") or {})}     # older runs: token-mean steps
         diff = {k: (ctor.get(k), v) for k, v in self.memory_shape.items() if ctor.get(k) != v}
         if diff:
             raise ValueError(f"Memory checkpoint {path} does not match this model "
@@ -180,15 +200,27 @@ class AGAMemoryModel(nn.Module):
         plus the auxiliary per-step logits, attention weights and (probe) base logits.
         """
         valid = valid.bool()
-        e = self.fx(self.pool(feats.float())) * valid[..., None]  # invalid steps contribute nothing
-        aux_v, aux_n = self.aux_verb(e), self.aux_noun(e)
-        pv, pn = aux_v.softmax(-1).detach(), aux_n.softmax(-1).detach()
+        if self.step_encoder == "mean":
+            e = self.fx(self.pool(feats.float())) * valid[..., None]  # invalid steps contribute nothing
+            sv = sn = e                                           # step embeddings per field
+            aux_v, aux_n = self.aux_verb(e), self.aux_noun(e)
+            pv, pn = aux_v.softmax(-1).detach(), aux_n.softmax(-1).detach()
+        else:                                                     # Member 2's probe on each step's clip
+            if feats.shape[2] != 1 or feats.shape[3] != self.step_dim:
+                raise ValueError(f"probe steps must be [B,S,1,{self.step_dim}] (probe_steps.py), "
+                                 f"got {tuple(feats.shape)}")
+            x = feats[:, :, 0].float()
+            part = lambda k: x[..., slice(*self.step_layout[k])]
+            sv = self.fv(part("verb_emb")) * valid[..., None]
+            sn = self.fn(part("noun_emb")) * valid[..., None]
+            aux_v, aux_n = self.aux_verb(sv), self.aux_noun(sn)
+            pv, pn = part("verb_logits").softmax(-1), part("noun_logits").softmax(-1)   # frozen probe
         pv, pn = pv * valid[..., None], pn * valid[..., None]
         z = {"history_available": valid[:, :-1].any(dim=1), "aux_verb_logits": aux_v, "aux_noun_logits": aux_n}
         if self.present_encoder == "mean":
-            z.update(verb_present=e[:, -1], noun_present=e[:, -1], present_available=valid[:, -1])
+            z.update(verb_present=sv[:, -1], noun_present=sn[:, -1], present_available=valid[:, -1])
         elif self.present_encoder == "none":                       # memory only: no present branch
-            zeros = torch.zeros_like(e[:, -1])
+            zeros = torch.zeros_like(sv[:, -1])
             z.update(verb_present=zeros, noun_present=zeros, present_available=torch.zeros_like(valid[:, -1]))
         else:
             if present_tokens is None or present_available is None:
@@ -201,11 +233,11 @@ class AGAMemoryModel(nn.Module):
                      base_verb_logits=self.present.verb_head(ev) * keep,
                      base_noun_logits=self.present.noun_head(en) * keep)
         if self.mode == "single":
-            h, w = self.mem(torch.cat([pv, pn], -1), e, valid)
+            h, w = self.mem(torch.cat([pv, pn], -1), sv, valid)
             z.update(verb_history=h, noun_history=h, attn=w)
         else:
-            hv, wv = self.mem_v(pv, e, valid)
-            hn, wn = self.mem_n(pn, e, valid)
+            hv, wv = self.mem_v(pv, sv, valid)
+            hn, wn = self.mem_n(pn, sn, valid)
             z.update(verb_history=hv, noun_history=hn, attn_verb=wv, attn_noun=wn)
         return z
 

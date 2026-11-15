@@ -96,6 +96,18 @@ class AuxLabeler:
         return verbs, nouns
 
 
+def clip_times(bank: FeatureBank, video_id: str) -> np.ndarray:
+    """Sorted clip end times of one video, without reading any features."""
+    if video_id in bank.entries:
+        return bank.entries[video_id]["times"]
+    return bank.index[video_id][0]
+
+
+def lookup(anchors, event):
+    """Anchor tokens of an event from an Anchors object or a {narration_id: tokens} dict."""
+    return anchors.for_event(event) if hasattr(anchors, "for_event") else anchors.get(event.narration_id)
+
+
 class HistoryDataset(Dataset):
     """One item per STA event. Works with any FeatureBank (mock now, real later).
 
@@ -105,30 +117,43 @@ class HistoryDataset(Dataset):
     future: V-JEPA predictor tokens of the exact STA clip for Member 4's future branch, as an
     Anchors(..., tokens_file="sta_pred_tokens.npy") or a dict {narration_id: tokens}. Adds
     "future_tokens" [T, D] and "future_available" (False: no clip, or an all-zero block).
+    step_bank / step_anchors: read the memory steps ("feats") from another bank with the same clips
+    and times, e.g. Member 2's probe outputs per clip (probe_steps.py); the present clip still comes
+    from `bank` / `anchors`.
     """
 
     def __init__(self, events, bank: FeatureBank, steps=16, stride=1.0, tolerance=None,
-                 aux: AuxLabeler | None = None, anchors=None, present_tokens: bool = False, future=None):
+                 aux: AuxLabeler | None = None, anchors=None, present_tokens: bool = False, future=None,
+                 step_bank: FeatureBank | None = None, step_anchors=None):
         self.events, self.bank, self.aux, self.anchors = list(events), bank, aux, anchors or {}
         self.steps, self.stride, self.tolerance = steps, stride, tolerance
         self.present_tokens, self.future = present_tokens, future
+        self.step_bank, self.step_anchors = step_bank, step_anchors or {}
         missing = sorted({e.video_id for e in self.events if e.sta_cutoff >= 0 and e.video_id not in bank})
         if missing:
             raise FileNotFoundError(f"No features for {len(missing)} videos: {missing[:5]}")
+        if step_bank is not None:
+            for v in sorted({e.video_id for e in self.events if e.sta_cutoff >= 0}):
+                if v not in step_bank or not np.array_equal(clip_times(step_bank, v), clip_times(bank, v)):
+                    raise ValueError(f"step bank and feature bank disagree on the clips of {v}; "
+                                     "were the step features computed from this feature folder?")
 
     def __len__(self):
         return len(self.events)
 
     def __getitem__(self, idx):
         e = self.events[idx]
-        entry = self.bank[e.video_id] if e.sta_cutoff >= 0 else None
-        anchor = (self.anchors.for_event(e) if hasattr(self.anchors, "for_event")
-                  else self.anchors.get(e.narration_id))
-        hist_anchor = anchor
-        if anchor is not None and tuple(anchor.shape) != tuple(self.bank.shape):
-            hist_anchor = anchor.float().mean(dim=0, keepdim=True)     # full anchor, pooled bank
+        hist_bank = self.bank if self.step_bank is None else self.step_bank
+        entry = hist_bank[e.video_id] if e.sta_cutoff >= 0 else None
+        anchor = lookup(self.anchors, e)
+        if self.step_bank is not None:
+            hist_anchor = lookup(self.step_anchors, e)                 # same clip, step representation
+        else:
+            hist_anchor = anchor
+            if anchor is not None and tuple(anchor.shape) != tuple(self.bank.shape):
+                hist_anchor = anchor.float().mean(dim=0, keepdim=True)     # full anchor, pooled bank
         h = build_history(e, entry, self.steps, self.stride, self.tolerance,
-                          hist_anchor, shape=self.bank.shape)
+                          hist_anchor, shape=hist_bank.shape)
         if self.aux is not None:
             av, an = self.aux(e.video_id, h["step_times"])
         else:

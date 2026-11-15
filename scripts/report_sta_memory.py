@@ -61,10 +61,11 @@ def fusion_label(a):
 
 def memory_label(a):
     """How the memory started: 'scratch', or 'pre-trained' / 'pre-trained (frozen)' when it was
-    initialised from a memory pre-training run (--memory-init)."""
-    if not a.get("memory_init"):
-        return "scratch"
-    return "pre-trained (frozen)" if a.get("freeze_memory") else "pre-trained"
+    initialised from a memory pre-training run (--memory-init); prefixed with 'probe steps, ' when
+    its steps are Member 2's probe outputs (--step-features) instead of token means."""
+    label = "scratch" if not a.get("memory_init") else \
+        "pre-trained (frozen)" if a.get("freeze_memory") else "pre-trained"
+    return f"probe steps, {label}" if a.get("step_features") else label
 
 
 def scores(res, breakdown):
