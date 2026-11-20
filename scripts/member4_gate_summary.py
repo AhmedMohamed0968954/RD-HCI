@@ -17,15 +17,35 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from report_sta_memory import fusion_label, prefer_official, scores   # Member 3's report helpers
+from report_sta_memory import fusion_label, memory_label, prefer_official, scores   # Member 3's report helpers
 
 BRANCH_NAMES = ("history", "present", "future")
 REFERENCE = "three_way H+P"
-ORDER = ["aga", "three_way P", "three_way H+P", "three_way P+F (future: mean)",
-         "three_way H+P+F (future: mean)", "three_way H+P+F (future: probe)"]
+# Member 3's memory variants (report_sta_memory.memory_label): pre-training, and probe outputs as steps
+PRE, PRE_FROZEN = " [memory pre-trained]", " [memory pre-trained (frozen)]"
+PS, PS_PRE, PS_FROZEN = (" [memory probe steps, scratch]", " [memory probe steps, pre-trained]",
+                         " [memory probe steps, pre-trained (frozen)]")
+FK_FROZEN = " [memory probe steps (feature keys), pre-trained (frozen)]"   # plain-attention baseline
+ORDER = ["aga", "aga" + PRE, "aga" + PRE_FROZEN, "aga" + PS, "aga" + PS_PRE, "aga" + PS_FROZEN, "aga" + FK_FROZEN,
+         "three_way P", "three_way H+P", "three_way H+P" + PRE, "three_way H+P" + PRE_FROZEN,
+         "three_way H+P" + PS_PRE, "three_way P+F (future: mean)",
+         "three_way H+P+F (future: mean)", "three_way H+P+F (future: probe)",
+         "three_way H+P+F (future: probe)" + PRE, "three_way H+P+F (future: probe)" + PS_PRE]
 DESCRIPTION = {"aga": "AGA 2-way gate (Member 3's best row)",
+               "aga" + PRE: "AGA 2-way gate, pre-trained memory",
+               "aga" + PRE_FROZEN: "AGA 2-way gate, pre-trained memory (frozen)",
+               "aga" + PS: "AGA 2-way gate, probe steps",
+               "aga" + PS_PRE: "AGA 2-way gate, probe steps, pre-trained memory",
+               "aga" + PS_FROZEN: "AGA 2-way gate, probe steps, pre-trained memory (frozen)",
+               "aga" + FK_FROZEN: "AGA 2-way gate, probe steps with feature keys (plain attention), pre-trained (frozen)",
                "three_way P": "present only (history off)",
                "three_way H+P": "history + present",
+               "three_way H+P" + PRE: "history + present, pre-trained memory",
+               "three_way H+P" + PRE_FROZEN: "history + present, pre-trained memory (frozen)",
+               "three_way H+P" + PS_PRE: "history + present, probe steps, pre-trained memory",
+               "three_way H+P+F (future: probe)" + PRE: "history + present + future (probe), pre-trained memory",
+               "three_way H+P+F (future: probe)" + PS_PRE:
+                   "history + present + future (probe), probe steps, pre-trained memory",
                "three_way P+F (future: mean)": "present + future (mean of predictor tokens)",
                "three_way H+P+F (future: mean)": "history + present + future (mean)",
                "three_way H+P+F (future: probe)": "history + present + future (Member 2's pred pathway, frozen)"}
@@ -44,7 +64,8 @@ def load(runs_dir: Path, steps: int, any_present: bool = False):
         same_present = a.get("present_encoder", "probe") == "probe" and a.get("freeze_present")
         if not any_present and (not same_present or a.get("no_anchor")):
             continue                      # same present encoder and clips as the gate rows only
-        label = fusion_label(a)
+        memory = memory_label(a)
+        label = fusion_label(a) + ("" if memory == "scratch" else f" [memory {memory}]")
         if label not in ORDER:
             continue
         row = {"run": run.name, "label": label, "seed": a["seed"], "best_epoch": m["best_epoch"],

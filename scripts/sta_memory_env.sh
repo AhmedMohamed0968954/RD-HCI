@@ -5,6 +5,8 @@ export EPIC_TEAM="${EPIC_TEAM:-/lustre1/scratch/394/vsc39484/epic-kitchens/team}
 export EPIC_FEATURES="${EPIC_FEATURES:-$EPIC_TEAM/features/vjepa21_vitl384_f16}"
 export EPIC_MANIFESTS="${EPIC_MANIFESTS:-$EPIC_TEAM/manifests/split_seed42}"
 export EPIC_PROBE_CKPT="${EPIC_PROBE_CKPT:-$EPIC_TEAM/results/member2_probe_full/STA_factorized/best.pt}"
+# Member 2's probe over every bank clip (scripts/precompute_probe_steps.slurm), for --step-features
+export EPIC_PROBE_STEPS="${EPIC_PROBE_STEPS:-$EPIC_TEAM/cache/probe_steps/$(basename "$EPIC_FEATURES")}"
 export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
 for need in "$EPIC_FEATURES/bank_tokens.npy" "$EPIC_FEATURES/events_index.csv" "$EPIC_MANIFESTS/train_sta.jsonl"; do
     [[ -r "$need" ]] || { echo "Missing $need (check EPIC_FEATURES / EPIC_MANIFESTS)"; exit 1; }

@@ -31,10 +31,12 @@ def load_runs(root: Path):
         if "best_val" not in m:                       # still training or crashed before the end
             continue
         a = cfg["args"]
+        present = a.get("present_encoder", "mean")
         row = {"run": run.name, "mode": a["mode"], "steps": a["steps"], "seed": a["seed"],
-               "fusion": fusion_label(a),
-               "present": a.get("present_encoder", "mean") + (" (frozen)" if a.get("freeze_present") else
-                          " (trainable)" if a.get("present_encoder") == "probe" else ""),
+               "fusion": fusion_label(a), "memory": memory_label(a),
+               "present": "none (memory only)" if present == "none" else
+                          present + (" (frozen)" if a.get("freeze_present") else
+                                     " (trainable)" if present == "probe" else ""),
                "anchor": not a.get("no_anchor", False), "best_epoch": m["best_epoch"]}
         row.update(scores(m["best_val"], m.get("best_val_breakdown")))
         init = m.get("init") or {}
@@ -55,6 +57,18 @@ def fusion_label(a):
             if b.strip() and (b.strip() != "future" or encoder != "none")]
     return f"three_way {'+'.join(b.strip()[0].upper() for b in kept)}" + (
         f" (future: {encoder})" if encoder != "none" else "")
+
+
+def memory_label(a):
+    """How the memory started: 'scratch', or 'pre-trained' / 'pre-trained (frozen)' when it was
+    initialised from a memory pre-training run (--memory-init); prefixed with 'probe steps, ' when
+    its steps are Member 2's probe outputs (--step-features) instead of token means."""
+    label = "scratch" if not a.get("memory_init") else \
+        "pre-trained (frozen)" if a.get("freeze_memory") else "pre-trained"
+    if not a.get("step_features"):
+        return label
+    keys = " (feature keys)" if a.get("step_keys", "predictions") == "features" else ""
+    return f"probe steps{keys}, {label}"
 
 
 def scores(res, breakdown):
@@ -94,7 +108,7 @@ def fmt(x):
 
 
 def write_tables(rows, out: Path):
-    cols = ["run", "mode", "present", "fusion", "steps", "seed", "anchor", "best_epoch", "action_mt5r", "verb_mt5r", "noun_mt5r",
+    cols = ["run", "mode", "memory", "present", "fusion", "steps", "seed", "anchor", "best_epoch", "action_mt5r", "verb_mt5r", "noun_mt5r",
             "unseen_action_mt5r", "tail_action_mt5r", "official_unseen_action_mt5r",
             "official_tail_action_mt5r", "action_top1"]
     base = baselines(rows)
@@ -108,8 +122,9 @@ def write_tables(rows, out: Path):
         lines.append(f"| none{'' if r['anchor'] else ' (no anchor)'} | probe alone (before training) | – | – | – | "
                      f"{fmt(r.get('action_mt5r'))} | {fmt(r.get('verb_mt5r'))} | {fmt(r.get('noun_mt5r'))} | "
                      f"{fmt(prefer_official(r, 'unseen_action_mt5r'))} | {fmt(prefer_official(r, 'tail_action_mt5r'))} |")
-    for r in sorted(rows, key=lambda r: (r["mode"], r["present"], r["fusion"], r["steps"], r["seed"])):
-        lines.append(f"| {r['mode']}{'' if r['anchor'] else ' (no anchor)'} | {r['present']} | {r['fusion']} | "
+    for r in sorted(rows, key=lambda r: (r["mode"], r["memory"], r["present"], r["fusion"], r["steps"], r["seed"])):
+        memory = "" if r["memory"] == "scratch" else f", {r['memory']}"
+        lines.append(f"| {r['mode']}{memory}{'' if r['anchor'] else ' (no anchor)'} | {r['present']} | {r['fusion']} | "
                      f"{r['steps']} | {r['seed']} | "
                      f"{fmt(r.get('action_mt5r'))} | {fmt(r.get('verb_mt5r'))} | {fmt(r.get('noun_mt5r'))} | "
                      f"{fmt(prefer_official(r, 'unseen_action_mt5r'))} | {fmt(prefer_official(r, 'tail_action_mt5r'))} |")
@@ -118,7 +133,8 @@ def write_tables(rows, out: Path):
 
 def plot_horizon(rows, out: Path, plt):
     groups = defaultdict(lambda: defaultdict(list))
-    base = [r for r in rows if r["anchor"] and r["fusion"] == "aga" and r.get("action_mt5r") is not None]
+    base = [r for r in rows if r["anchor"] and r["fusion"] == "aga" and r["memory"] == "scratch"
+            and r.get("action_mt5r") is not None]
     presents = [r["present"] for r in base]
     # one present setting per plot: the frozen probe (main ablation) when present, else the most common
     chosen = "probe (frozen)" if "probe (frozen)" in presents else max(set(presents), key=presents.count, default=None)

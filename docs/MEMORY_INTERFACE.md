@@ -106,6 +106,75 @@ sbatch --array=4-7%3 -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-ablation-%A_%
 python scripts/report_sta_memory.py --runs-dir "$EPIC_TEAM/results/sta_memory" --out-dir report_sta
 ```
 
+### Memory pre-training (gate collapse, plan item 5)
+
+With a memory trained from scratch, the gates hand everything to the frozen probe within the first
+epochs (AGA gate ~0.07 for the history, three-way gate ≥ 0.98 on the present,
+docs/MEMBER4_GATE_ABLATION.md): the memory starts as noise while the probe has already converged.
+Pre-training gives the memory a head start:
+
+1. **Stage 1, memory only** (`--present-encoder none`): no probe and no gate. The verb/noun heads
+   read the retrieved history `h` directly, so the STA action has to be predicted from the past
+   steps' features (the query still sees the model's own prediction for the last step, as in AGA).
+   The auxiliary per-step loss is unchanged.
+2. **Stage 2, warm start** (`--memory-init <stage 1>/best.pt`): the usual model with Member 2's
+   frozen probe; the memory part (`fx`, `aux_verb` / `aux_noun`, `mem_v` / `mem_n`) is loaded
+   from stage 1, the gate and the correction head start fresh (correction = 0, so the score
+   before training is still the probe alone). `--freeze-memory` keeps the loaded memory fixed.
+   Works with both gates (`--fusion aga` and `three_way`).
+
+```bash
+# one job per seed: stage 1, then the stage-2 rows (see the script header for the comparisons)
+for s in 42 1 2; do
+  sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" scripts/sta_memory_pretrain.slurm $s
+done
+python scripts/member4_gate_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" \
+       --out "$EPIC_TEAM/results/sta_memory_pretrain.md"    # pre-trained rows next to the scratch rows
+```
+
+What answers the question: `_3way_warm` against `_3way_P` (history off) with the same seed, and
+the gate weights for history. Pre-trained runs get their own rows in both report scripts
+(`memory` column; `[memory pre-trained]` labels), so they are never averaged with scratch runs.
+
+First results (split_seed42, 3 seeds): AGA gate 8.09 → **8.28 ± 0.11** with the pre-trained memory
+(8.27 frozen), history share of the gate 0.09 → ~0.5; three-way H+P 8.00 → 8.18 (noun gate then
+selects the history, 0.99). Details: project doc `member3_sta_memory_results.md`.
+
+### Probe outputs as memory steps (`--step-features`)
+
+The memory summarised each past second by its token mean, while the present clip goes through
+Member 2's probe. Since that probe is frozen, `scripts/precompute_probe_steps.slurm` runs it once over
+all 360k bank clips and the STA clips (`epic_starter/memory/probe_steps.py`, ~1.8 GB, same rows and
+times as the feature folder). With `--step-features "$EPIC_PROBE_STEPS"` each memory step is then
+Member 2's probe on that second's clip: the verb memory's **values** are the probe's verb embeddings
+and its **keys** the probe's verb probabilities (AGA's "the model's own predictions" with the strong
+model), likewise for nouns; the auxiliary heads stay as a training signal. Training reads the stored
+rows, so it is as fast as before. The run refuses step features computed from another feature bank or
+with another probe than `--present-init` (regenerate after Member 2 retrains the probe).
+
+```bash
+J=$(sbatch --parsable -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/probe-steps-%j.out" scripts/precompute_probe_steps.slurm)
+for s in 42 1 2; do
+  sbatch --dependency=afterok:${J%%;*} -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/sta-pretrain-%j.out" \
+         scripts/sta_memory_pretrain.slurm $s probe
+done
+```
+
+Run names get `_psteps` (e.g. `decoupled_S16_seed42_psteps_warm`); `decoupled_S16_seed<N>_psteps` is the
+memory from scratch on probe steps, which separates the effect of the steps from pre-training. Caveat:
+the probe was trained on the training events, so its predictions (keys) are more confident on training
+clips than on validation clips; the present branch has the same property.
+
+Results (3 seeds): memory only 4.28 → 7.46 with probe steps; best row **probe steps, pre-trained,
+frozen: 8.42 ± 0.02** (fine-tuned 8.37 ± 0.23 overfits; from scratch 8.18).
+
+Follow-ups on that configuration, `scripts/sta_memory_next.slurm <seed>` (array of 5, both stages each):
+S = 8 / 30 / 60, `--no-anchor` (test-like; its test predictions are the submission) and the
+plain-attention baseline `--step-keys features` (keys and query from the probe's embeddings instead of
+its predictions, nothing else changed). One row per configuration, mean ± sd over seeds and gate
+weights: `scripts/sta_memory_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" [--match psteps]`
+(on a compute node; see its header).
+
 Measured cost: data loading ~0.25 ms/event; with the probe ~1.4 s per batch of 256 on 2 cores,
 i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 `-p gpu_p100 --gpus-per-node=1` to `sbatch` and `export EPIC_GPU_ENV=<CUDA venv>`.
@@ -115,7 +184,7 @@ i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 | file | for whom | content |
 |---|---|---|
 | `metrics.json` | everyone | per-epoch scores (all / `unseen` / `tail` as Member 2), best epoch, Member 1's official breakdown |
-| `config.json` | report | arguments, git commit, feature `meta.json`, probe init, split sizes |
+| `config.json` | report | arguments, git commit, feature `meta.json`, probe and memory init, split sizes |
 | `best.pt` | Member 4 | weights + constructor arguments of the best epoch |
 | `val_outputs.npz` | Member 1 | raw verb/noun logits, labels, `use_prior`, prior, attention, gates, present source |
 | `test_outputs.npz` | Member 1 | raw hidden-test logits (calibrate, then package with AR) |
