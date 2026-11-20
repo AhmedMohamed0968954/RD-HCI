@@ -25,7 +25,8 @@ REFERENCE = "three_way H+P"
 PRE, PRE_FROZEN = " [memory pre-trained]", " [memory pre-trained (frozen)]"
 PS, PS_PRE, PS_FROZEN = (" [memory probe steps, scratch]", " [memory probe steps, pre-trained]",
                          " [memory probe steps, pre-trained (frozen)]")
-ORDER = ["aga", "aga" + PRE, "aga" + PRE_FROZEN, "aga" + PS, "aga" + PS_PRE, "aga" + PS_FROZEN,
+FK_FROZEN = " [memory probe steps (feature keys), pre-trained (frozen)]"   # plain-attention baseline
+ORDER = ["aga", "aga" + PRE, "aga" + PRE_FROZEN, "aga" + PS, "aga" + PS_PRE, "aga" + PS_FROZEN, "aga" + FK_FROZEN,
          "three_way P", "three_way H+P", "three_way H+P" + PRE, "three_way H+P" + PRE_FROZEN,
          "three_way H+P" + PS_PRE, "three_way P+F (future: mean)",
          "three_way H+P+F (future: mean)", "three_way H+P+F (future: probe)",
@@ -36,6 +37,7 @@ DESCRIPTION = {"aga": "AGA 2-way gate (Member 3's best row)",
                "aga" + PS: "AGA 2-way gate, probe steps",
                "aga" + PS_PRE: "AGA 2-way gate, probe steps, pre-trained memory",
                "aga" + PS_FROZEN: "AGA 2-way gate, probe steps, pre-trained memory (frozen)",
+               "aga" + FK_FROZEN: "AGA 2-way gate, probe steps with feature keys (plain attention), pre-trained (frozen)",
                "three_way P": "present only (history off)",
                "three_way H+P": "history + present",
                "three_way H+P" + PRE: "history + present, pre-trained memory",

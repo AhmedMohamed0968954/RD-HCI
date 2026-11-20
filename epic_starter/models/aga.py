@@ -18,6 +18,8 @@ Memory steps (step_encoder):
            epic_starter/memory/probe_steps.py): the verb memory's values are the probe's verb
            embeddings and its keys the probe's verb probabilities, likewise for nouns. The
            auxiliary heads stay (same training signal), but no longer produce the keys.
+           step_keys="features" (plain-attention baseline): keys and query come from the probe's
+           embeddings instead of its predictions; everything else is unchanged.
 
 Memory pre-training (two stages):
   1. present_encoder="none": no present branch and no gate. The STA label is predicted from the
@@ -96,7 +98,8 @@ class AGAMemoryModel(nn.Module):
     """
 
     def __init__(self, feat_dim, d=256, heads=4, alpha=0.8, mode="decoupled", dropout=0.3,
-                 present_encoder="mean", freeze_present=False, freeze_memory=False, step_encoder="mean"):
+                 present_encoder="mean", freeze_present=False, freeze_memory=False, step_encoder="mean",
+                 step_keys="predictions"):
         super().__init__()
         if mode not in {"single", "decoupled"}:
             raise ValueError("mode must be single or decoupled")
@@ -106,13 +109,15 @@ class AGAMemoryModel(nn.Module):
             raise ValueError("step_encoder must be mean or probe")
         if step_encoder == "probe" and mode != "decoupled":
             raise ValueError("step_encoder='probe' has separate verb/noun steps: use mode='decoupled'")
+        if step_keys not in {"predictions", "features"} or (step_keys == "features" and step_encoder != "probe"):
+            raise ValueError("step_keys must be predictions, or features with step_encoder='probe'")
         if d % heads:
             raise ValueError("d must be divisible by heads")
         self.mode, self.present_encoder, self.freeze_present = mode, present_encoder, freeze_present
-        self.freeze_memory, self.step_encoder = freeze_memory, step_encoder
+        self.freeze_memory, self.step_encoder, self.step_keys = freeze_memory, step_encoder, step_keys
         # what a memory checkpoint must match to be loaded into this model (load_memory)
         self.memory_shape = {"feat_dim": feat_dim, "d": d, "heads": heads, "alpha": alpha, "mode": mode,
-                             "step_encoder": step_encoder}
+                             "step_encoder": step_encoder, "step_keys": step_keys}
         self.pool = lambda x: x.mean(dim=2)                       # [B,S,T,D] -> [B,S,D]
         if step_encoder == "mean":
             self.fx = nn.Sequential(nn.LayerNorm(feat_dim), nn.Dropout(dropout), nn.Linear(feat_dim, d))
@@ -125,7 +130,8 @@ class AGAMemoryModel(nn.Module):
         if mode == "single":
             self.mem = Memory(N_VERB + N_NOUN, d, heads, alpha)
         else:
-            self.mem_v, self.mem_n = Memory(N_VERB, d, heads, alpha), Memory(N_NOUN, d, heads, alpha)
+            kv, kn = (feat_dim, feat_dim) if step_keys == "features" else (N_VERB, N_NOUN)
+            self.mem_v, self.mem_n = Memory(kv, d, heads, alpha), Memory(kn, d, heads, alpha)
         if present_encoder != "none":
             self.gate_v, self.gate_n = Gate(d), Gate(d)
         self.head_verb = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_VERB))
@@ -167,7 +173,7 @@ class AGAMemoryModel(nn.Module):
         The feature size, d, heads, alpha and mode must match; S may differ (no weight depends on it).
         Returns the source run's epoch, val action MT5R and present encoder."""
         ckpt = torch.load(path, map_location=map_location, weights_only=False)
-        ctor = {"step_encoder": "mean", **(ckpt.get("ctor") or {})}     # older runs: token-mean steps
+        ctor = {"step_encoder": "mean", "step_keys": "predictions", **(ckpt.get("ctor") or {})}   # older runs
         diff = {k: (ctor.get(k), v) for k, v in self.memory_shape.items() if ctor.get(k) != v}
         if diff:
             raise ValueError(f"Memory checkpoint {path} does not match this model "
@@ -214,7 +220,10 @@ class AGAMemoryModel(nn.Module):
             sv = self.fv(part("verb_emb")) * valid[..., None]
             sn = self.fn(part("noun_emb")) * valid[..., None]
             aux_v, aux_n = self.aux_verb(sv), self.aux_noun(sn)
-            pv, pn = part("verb_logits").softmax(-1), part("noun_logits").softmax(-1)   # frozen probe
+            if self.step_keys == "predictions":
+                pv, pn = part("verb_logits").softmax(-1), part("noun_logits").softmax(-1)   # frozen probe
+            else:                                                 # plain attention: embeddings as keys
+                pv, pn = part("verb_emb"), part("noun_emb")
         pv, pn = pv * valid[..., None], pn * valid[..., None]
         z = {"history_available": valid[:, :-1].any(dim=1), "aux_verb_logits": aux_v, "aux_noun_logits": aux_n}
         if self.present_encoder == "mean":

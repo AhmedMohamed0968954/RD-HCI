@@ -65,7 +65,10 @@ def memory_label(a):
     its steps are Member 2's probe outputs (--step-features) instead of token means."""
     label = "scratch" if not a.get("memory_init") else \
         "pre-trained (frozen)" if a.get("freeze_memory") else "pre-trained"
-    return f"probe steps, {label}" if a.get("step_features") else label
+    if not a.get("step_features"):
+        return label
+    keys = " (feature keys)" if a.get("step_keys", "predictions") == "features" else ""
+    return f"probe steps{keys}, {label}"
 
 
 def scores(res, breakdown):

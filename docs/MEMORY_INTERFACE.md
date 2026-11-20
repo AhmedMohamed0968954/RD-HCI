@@ -165,6 +165,16 @@ memory from scratch on probe steps, which separates the effect of the steps from
 the probe was trained on the training events, so its predictions (keys) are more confident on training
 clips than on validation clips; the present branch has the same property.
 
+Results (3 seeds): memory only 4.28 → 7.46 with probe steps; best row **probe steps, pre-trained,
+frozen: 8.42 ± 0.02** (fine-tuned 8.37 ± 0.23 overfits; from scratch 8.18).
+
+Follow-ups on that configuration, `scripts/sta_memory_next.slurm <seed>` (array of 5, both stages each):
+S = 8 / 30 / 60, `--no-anchor` (test-like; its test predictions are the submission) and the
+plain-attention baseline `--step-keys features` (keys and query from the probe's embeddings instead of
+its predictions, nothing else changed). One row per configuration, mean ± sd over seeds and gate
+weights: `scripts/sta_memory_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" [--match psteps]`
+(on a compute node; see its header).
+
 Measured cost: data loading ~0.25 ms/event; with the probe ~1.4 s per batch of 256 on 2 cores,
 i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 `-p gpu_p100 --gpus-per-node=1` to `sbatch` and `export EPIC_GPU_ENV=<CUDA venv>`.

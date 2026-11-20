@@ -88,6 +88,9 @@ def parse_args(argv=None):
     m.add_argument("--step-features", help="folder from scripts/precompute_probe_steps.py: every memory step is "
                                            "Member 2's frozen probe on that second's clip (verb/noun embeddings "
                                            "as values, its predictions as keys) instead of the token mean")
+    m.add_argument("--step-keys", choices=["predictions", "features"], default="predictions",
+                   help="with --step-features: keys/query from the probe's predictions (AGA, default) or "
+                        "from its embeddings (plain-attention baseline)")
     m.add_argument("--fusion", choices=["aga", "three_way"], default="aga",
                    help="aga: AGA's 2-way gate (baseline); three_way: Member 4's ThreeWayGate "
                         "over history, present and (with --future-encoder) future")
@@ -130,6 +133,8 @@ def parse_args(argv=None):
         p.error("--present-encoder none has no present branch to fuse; use --fusion aga")
     if a.step_features and (a.mode != "decoupled" or not a.features_dir):
         p.error("--step-features needs --mode decoupled and the --features-dir it was computed from")
+    if a.step_keys != "predictions" and not a.step_features:
+        p.error("--step-keys features needs --step-features")
     try:
         branches = parse_branches(a.branches)
     except ValueError as err:
@@ -409,7 +414,8 @@ def main(argv=None):
 
     ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout,
                 present_encoder=a.present_encoder, freeze_present=a.freeze_present,
-                freeze_memory=a.freeze_memory, step_encoder="probe" if step_bank is not None else "mean")
+                freeze_memory=a.freeze_memory, step_encoder="probe" if step_bank is not None else "mean",
+                step_keys=a.step_keys)
     model = AGAMemoryModel(**ctor)
     present_init = None
     if a.present_init:

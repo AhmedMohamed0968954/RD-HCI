@@ -372,3 +372,46 @@ def test_probe_steps_keys_are_the_probe_predictions():
     assert not torch.allclose(base["attn_noun"], moved["attn_noun"])
     with pytest.raises(ValueError, match="probe steps"):
         model(torch.randn(2, 5, 1, 16), valid)
+
+
+def test_feature_keys_baseline_and_summary(toy, tmp_path):
+    """Plain-attention baseline (--step-keys features) trains end to end, never mixes with AGA keys,
+    and the summary groups runs over seeds."""
+    from epic_starter.memory.probe_steps import precompute
+    from epic_starter.models.aga import AGAMemoryModel
+    events = load_events(toy / "train.csv")
+    feats = tmp_path / "f16"
+    write_mock_consolidated(events, feats, tokens=24, dim=16)
+    ckpt = tmp_path / "probe.pt"
+    probe_checkpoint(ckpt)
+    steps = precompute(feats, ckpt, tmp_path / "psteps", batch_size=64, log=lambda m: None)
+    train = script("train_sta_memory")
+    common = ["--train-csv", str(toy / "train.csv"), "--features-dir", str(feats), "--step-features", str(steps),
+              "--steps", "4", "--d-model", "16", "--heads", "2", "--num-workers", "0", "--device", "cpu",
+              "--epochs", "1"]
+    runs = toy / "runs"
+    for seed in (1, 2):
+        mo = runs / f"decoupled_S4_seed{seed}_psteps_fkeys_memonly"
+        train.main(common + ["--seed", str(seed), "--step-keys", "features", "--present-encoder", "none",
+                             "--out-dir", str(mo)])
+        train.main(common + ["--seed", str(seed), "--step-keys", "features", "--present-init", str(ckpt),
+                             "--freeze-present", "--memory-init", str(mo / "best.pt"), "--freeze-memory",
+                             "--out-dir", str(runs / f"decoupled_S4_seed{seed}_psteps_fkeys_warm_frozenmem")])
+    state = torch.load(runs / "decoupled_S4_seed1_psteps_fkeys_memonly" / "best.pt")["state_dict"]
+    assert state["mem_v.ek.1.weight"].shape == (16, 16)        # keys read the 16-dim embeddings
+    with pytest.raises(ValueError, match="does not match"):     # AGA-key model cannot load it
+        AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="probe", step_encoder="probe").load_memory(
+            runs / "decoupled_S4_seed1_psteps_fkeys_memonly" / "best.pt")
+    with pytest.raises(ValueError):
+        AGAMemoryModel(feat_dim=16, d=16, heads=2, step_keys="features")      # needs probe steps
+    with pytest.raises(SystemExit):
+        train.parse_args(["--train-csv", "x.csv", "--out-dir", "o", "--step-keys", "features"])
+    groups = script("sta_memory_summary").main(["--runs-dir", str(runs), "--match", "fkeys",
+                                                "--out", str(tmp_path / "summary.md")])
+    assert set(groups) == {"decoupled_S4_psteps_fkeys_memonly", "decoupled_S4_psteps_fkeys_warm_frozenmem"}
+    assert set(groups["decoupled_S4_psteps_fkeys_warm_frozenmem"]) == {1, 2}
+    table = (tmp_path / "summary.md").read_text()
+    assert "| decoupled_S4_psteps_fkeys_warm_frozenmem | 1,2 |" in table
+    labels = {r["label"] for r in script("member4_gate_summary").main(
+        ["--runs-dir", str(runs), "--steps", "4", "--out", str(tmp_path / "gate.md")])}
+    assert "aga [memory probe steps (feature keys), pre-trained (frozen)]" in labels
