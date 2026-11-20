@@ -1,0 +1,100 @@
+{
+  "split_type": "hybrid_seen_unseen",
+  "annotation_sha256": "a3a7ef2e397bd8af12bd0496b09d61b1f2c1f3f6e1726fa86af50a27f4855e87",
+  "parameters": {
+    "unseen_participants_given": [],
+    "unseen_fraction": 0.06,
+    "seen_fraction": 0.08,
+    "seen_max_fraction": 0.15,
+    "sta_context_seconds": 5.0,
+    "head_share": 0.8
+  },
+  "unseen_participants": [
+    "P08",
+    "P11",
+    "P29"
+  ],
+  "seen_val_video_ids": [
+    "P02_130",
+    "P02_131",
+    "P02_132",
+    "P02_133",
+    "P02_134",
+    "P02_135",
+    "P03_120",
+    "P03_121",
+    "P03_122",
+    "P03_123",
+    "P04_121",
+    "P06_109",
+    "P06_110",
+    "P06_113",
+    "P07_117",
+    "P09_105",
+    "P09_106",
+    "P12_105",
+    "P13_10",
+    "P16_03",
+    "P22_115",
+    "P22_116",
+    "P22_117",
+    "P26_124",
+    "P27_105",
+    "P28_112",
+    "P28_113",
+    "P30_112",
+    "P30_113",
+    "P30_114",
+    "P31_14",
+    "P35_109",
+    "P37_103"
+  ],
+  "events": {
+    "train": 57751,
+    "val": 9466,
+    "val_unseen": 4699,
+    "val_seen": 4767
+  },
+  "fractions": {
+    "val": 0.14082746924141215,
+    "val_unseen": 0.06990791020128836,
+    "val_seen": 0.07091955904012377
+  },
+  "coverage": {
+    "verb": 0.8631578947368421,
+    "noun": 0.7132616487455197,
+    "verb_instance_weighted": 0.9944589704074388,
+    "noun_instance_weighted": 0.959585115409257,
+    "verb_classes_in_train": 95,
+    "noun_classes_in_train": 279,
+    "val_classes_missing_from_train": {
+      "verb": [
+        93,
+        95
+      ],
+      "noun": [
+        203,
+        213,
+        239,
+        250,
+        251,
+        252,
+        255,
+        266,
+        272,
+        274
+      ]
+    }
+  },
+  "tail_val_events": {
+    "val_events_tail_verb": 2139,
+    "val_events_tail_noun": 2413,
+    "val_events_tail_action": 3795
+  },
+  "hidden_test_provided": true,
+  "sta_no_history_events": {
+    "train": 65,
+    "val": 30,
+    "test": 27
+  }
+}
