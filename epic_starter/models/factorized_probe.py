@@ -22,6 +22,7 @@ class TokenBank:
         self._ar = None
         self._sta_obs = None
         self._sta_pred = None
+        self._sta_pred17 = None
 
     def ar_tokens(self, narration_id: str) -> torch.Tensor:
         if self._ar is None:
@@ -50,6 +51,17 @@ class TokenBank:
             if end_s > sta_cutoff + 1e-5:
                 raise AssertionError(f"STA leakage detected for {narration_id}: {end_s} > {sta_cutoff}")
         return torch.from_numpy(np.array(self._sta_pred[r], dtype=np.float32)), use_prior
+
+    def sta_pred17_tokens(self, narration_id: str, sta_cutoff: float | None = None) -> tuple[torch.Tensor, bool]:
+        if self._sta_pred17 is None:
+            self._sta_pred17 = np.load(self.root / "sta_pred17_1664.npy", mmap_mode="r")
+        r = self.row[narration_id]
+        use_prior = self.use_prior_map[narration_id]
+        if self.verify_leakage and sta_cutoff is not None and not use_prior:
+            end_s = self.sta_clip_end[narration_id]
+            if end_s > sta_cutoff + 1e-5:
+                raise AssertionError(f"STA leakage detected for {narration_id}: {end_s} > {sta_cutoff}")
+        return torch.from_numpy(np.array(self._sta_pred17[r], dtype=np.float32)), use_prior
 
 
 class MultiQueryCrossAttentionPool(nn.Module):
@@ -105,7 +117,8 @@ class FactorizedAttentiveProbe(nn.Module):
         mode: str = "factorized",
     ):
         super().__init__()
-        if mode not in {"factorized", "factorized_pred", "full_attn", "mean_pool"}:
+        valid_modes = {"factorized", "factorized_pred", "factorized_pred_1664", "pred_17_only", "full_attn", "mean_pool", "split_mean_mlp"}
+        if mode not in valid_modes:
             raise ValueError(f"Unsupported mode: {mode}")
         self.embed_dim = embed_dim
         self.mode = mode
@@ -114,11 +127,34 @@ class FactorizedAttentiveProbe(nn.Module):
         self.temp_pos = nn.Parameter(torch.randn(1, 8, embed_dim) * 0.02)
         self.spat_pos = nn.Parameter(torch.randn(1, 16, embed_dim) * 0.02)
 
-        if mode in {"factorized", "factorized_pred", "full_attn"}:
+        if mode == "split_mean_mlp":
+            # Dynamically match trainable parameter count of "factorized" within < 1%
+            ref = FactorizedAttentiveProbe(
+                embed_dim=embed_dim, num_queries=num_queries, num_heads=num_heads,
+                num_verbs=num_verbs, num_nouns=num_nouns, dropout=dropout, mode="factorized",
+            )
+            target_params = sum(p.numel() for p in ref.parameters() if p.requires_grad)
+            # Non-MLP params: temp_pos(8d) + spat_pos(16d) + 4*LN(d) + heads((d+1)*(V+N)) + out_bias(2d)
+            non_mlp = (8 + 16) * embed_dim + 8 * embed_dim + (embed_dim + 1) * (num_verbs + num_nouns) + 2 * embed_dim
+            per_hidden = 4 * embed_dim + 3  # Linear(2d, h) + LN(h) + Linear(h, 2d)
+            d_hidden = max(64, round((target_params - non_mlp) / per_hidden))
+            self.ln_temp_split = nn.LayerNorm(embed_dim)
+            self.ln_spat_split = nn.LayerNorm(embed_dim)
+            self.split_mlp = nn.Sequential(
+                nn.Linear(embed_dim * 2, d_hidden),
+                nn.GELU(),
+                nn.LayerNorm(d_hidden),
+                nn.Dropout(dropout),
+                nn.Linear(d_hidden, embed_dim * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+
+        if mode in {"factorized", "factorized_pred", "factorized_pred_1664", "full_attn"}:
             self.verb_pool = MultiQueryCrossAttentionPool(embed_dim, num_queries, num_heads, dropout)
             self.noun_pool = MultiQueryCrossAttentionPool(embed_dim, num_queries, num_heads, dropout)
 
-        if mode in {"factorized", "factorized_pred"}:
+        if mode in {"factorized", "factorized_pred", "factorized_pred_1664"}:
             # Separate token-type embeddings + learnable attention logit biases for Verb (temporal) vs Noun (spatial)
             self.verb_type_emb = nn.Parameter(torch.randn(1, 2, embed_dim) * 0.02)
             self.noun_type_emb = nn.Parameter(torch.randn(1, 2, embed_dim) * 0.02)
@@ -144,16 +180,36 @@ class FactorizedAttentiveProbe(nn.Module):
                 nn.Dropout(dropout),
             )
 
-        if mode == "factorized_pred":
+        if mode in {"factorized_pred", "factorized_pred_1664", "pred_17_only"}:
+            if mode in {"factorized_pred_1664", "pred_17_only"}:
+                self.pred_teacher_proj = nn.Sequential(
+                    nn.LayerNorm(1664),
+                    nn.Linear(1664, embed_dim),
+                )
+            if mode == "factorized_pred_1664":
+                self.obs_ctx_adapter = nn.Sequential(
+                    nn.LayerNorm(embed_dim),
+                    nn.Linear(embed_dim, embed_dim),
+                )
+            if mode == "pred_17_only":
+                self.pred17_temp_pos = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+                self.pred17_spat_pos = nn.Parameter(torch.randn(1, 16, embed_dim) * 0.02)
+                v17_bias = torch.zeros(num_queries, 17)
+                v17_bias[:, :1] = 1.0
+                n17_bias = torch.zeros(num_queries, 17)
+                n17_bias[:, 1:] = 1.0
+                self.pred17_verb_bias = nn.Parameter(v17_bias)
+                self.pred17_noun_bias = nn.Parameter(n17_bias)
             # Separate projection + LayerNorm gate for teacher-space predictor tokens (1664->1024 sliced)
             self.pred_verb_pool = MultiQueryCrossAttentionPool(embed_dim, num_queries, num_heads, dropout)
             self.pred_noun_pool = MultiQueryCrossAttentionPool(embed_dim, num_queries, num_heads, dropout)
-            self.ln_obs_v = nn.LayerNorm(embed_dim)
-            self.ln_pred_v = nn.LayerNorm(embed_dim)
-            self.ln_obs_n = nn.LayerNorm(embed_dim)
-            self.ln_pred_n = nn.LayerNorm(embed_dim)
-            self.gate_v = nn.Linear(embed_dim * 2, 2)
-            self.gate_n = nn.Linear(embed_dim * 2, 2)
+            if mode in {"factorized_pred", "factorized_pred_1664"}:
+                self.ln_obs_v = nn.LayerNorm(embed_dim)
+                self.ln_pred_v = nn.LayerNorm(embed_dim)
+                self.ln_obs_n = nn.LayerNorm(embed_dim)
+                self.ln_pred_n = nn.LayerNorm(embed_dim)
+                self.gate_v = nn.Linear(embed_dim * 2, 2)
+                self.gate_n = nn.Linear(embed_dim * 2, 2)
 
         self.norm_v = nn.LayerNorm(embed_dim)
         self.norm_n = nn.LayerNorm(embed_dim)
@@ -179,6 +235,24 @@ class FactorizedAttentiveProbe(nn.Module):
             en_raw = z_all.mean(dim=1)
             e_v = self.norm_v(ev_raw)
             e_n = self.norm_n(en_raw)
+        elif self.mode == "split_mean_mlp":
+            z_temp = self.ln_temp_split(e_temp.mean(dim=1))
+            z_spat = self.ln_spat_split(e_spat.mean(dim=1))
+            z_cat = torch.cat([z_temp, z_spat], dim=-1)
+            ev_raw, en_raw = (z_cat + self.split_mlp(z_cat)).chunk(2, dim=-1)
+            e_v = self.norm_v(ev_raw)
+            e_n = self.norm_n(en_raw)
+        elif self.mode == "pred_17_only":
+            if pred_tokens is None:
+                raise ValueError("pred_17_only mode requires pred_tokens [B, 17, 1664]")
+            p17 = self.pred_teacher_proj(pred_tokens)
+            p_all = torch.cat(
+                [p17[:, :1, :] + self.pred17_temp_pos, p17[:, 1:, :] + self.pred17_spat_pos], dim=1
+            )
+            fv_raw = self.pred_verb_pool(p_all, attn_bias=self.pred17_verb_bias)
+            fn_raw = self.pred_noun_pool(p_all, attn_bias=self.pred17_noun_bias)
+            e_v = self.norm_v(fv_raw)
+            e_n = self.norm_n(fn_raw)
         elif self.mode == "full_attn":
             if return_attn:
                 ev_raw, attn_dict["verb_attn"] = self.verb_pool(z_all, return_attn=True)
@@ -210,9 +284,16 @@ class FactorizedAttentiveProbe(nn.Module):
             e_v = self.norm_v(ev_raw + self.verb_interact(joint))
             e_n = self.norm_n(en_raw + self.noun_interact(joint))
 
-            if self.mode == "factorized_pred" and pred_tokens is not None:
-                p_temp = pred_tokens[:, :8, :] + self.temp_pos
-                p_spat = pred_tokens[:, 8:, :] + self.spat_pos
+            if self.mode in {"factorized_pred", "factorized_pred_1664"} and pred_tokens is not None:
+                if self.mode == "factorized_pred_1664":
+                    # Per-source adapters: 7 observed temporal tokens (1024) + 17 teacher tokens (1664 -> 1024)
+                    obs_ctx_7 = self.obs_ctx_adapter(tokens[:, 1:8, :])
+                    pred_17 = self.pred_teacher_proj(pred_tokens)
+                    p_temp = torch.cat([obs_ctx_7, pred_17[:, :1, :]], dim=1) + self.temp_pos
+                    p_spat = pred_17[:, 1:, :] + self.spat_pos
+                else:
+                    p_temp = pred_tokens[:, :8, :] + self.temp_pos
+                    p_spat = pred_tokens[:, 8:, :] + self.spat_pos
                 p_all = torch.cat([p_temp, p_spat], dim=1)
                 fv_raw = self.pred_verb_pool(p_all, attn_bias=self.verb_attn_bias)
                 fn_raw = self.pred_noun_pool(p_all, attn_bias=self.noun_attn_bias)

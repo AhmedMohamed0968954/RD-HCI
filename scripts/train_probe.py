@@ -22,11 +22,11 @@ from epic_starter.models.factorized_probe import TokenBank, FactorizedAttentiveP
 
 
 class ManifestTokenDataset(Dataset):
-    def __init__(self, rows: list[dict], bank: TokenBank, task: str, load_pred: bool = False):
+    def __init__(self, rows: list[dict], bank: TokenBank, task: str, pred_mode: str = "none"):
         self.rows = rows
         self.bank = bank
         self.task = task
-        self.load_pred = load_pred
+        self.pred_mode = pred_mode
 
     def __len__(self):
         return len(self.rows)
@@ -40,8 +40,10 @@ class ManifestTokenDataset(Dataset):
             use_prior = False
         else:
             tokens, use_prior = self.bank.sta_obs_tokens(nid, sta_cutoff=r["sta_cutoff"])
-            if self.load_pred:
+            if self.pred_mode == "pred24":
                 pred_tokens, _ = self.bank.sta_pred_tokens(nid, sta_cutoff=r["sta_cutoff"])
+            elif self.pred_mode == "pred17":
+                pred_tokens, _ = self.bank.sta_pred17_tokens(nid, sta_cutoff=r["sta_cutoff"])
             else:
                 pred_tokens = tokens
         verb = -1 if r["verb"] is None else int(r["verb"])
@@ -76,7 +78,11 @@ def main():
     parser.add_argument("--feature-dir", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--task", choices=["AR", "STA"], default="AR")
-    parser.add_argument("--mode", choices=["factorized", "factorized_pred", "full_attn", "mean_pool"], default="factorized")
+    parser.add_argument(
+        "--mode",
+        choices=["factorized", "factorized_pred", "factorized_pred_1664", "pred_17_only", "full_attn", "mean_pool", "split_mean_mlp"],
+        default="factorized",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -103,10 +109,16 @@ def main():
     if not train_rows or not val_rows:
         raise RuntimeError(f"Insufficient matched events: train={len(train_rows)}, val={len(val_rows)}")
 
-    load_pred = args.mode == "factorized_pred" and args.task == "STA"
+    if args.task == "STA" and args.mode == "factorized_pred":
+        pred_mode = "pred24"
+    elif args.task == "STA" and args.mode in {"factorized_pred_1664", "pred_17_only"}:
+        pred_mode = "pred17"
+    else:
+        pred_mode = "none"
+    load_pred = pred_mode != "none"
     subsets = compute_subset_masks(all_train_rows, val_rows)
-    train_ds = ManifestTokenDataset(train_rows, bank, args.task, load_pred=load_pred)
-    val_ds = ManifestTokenDataset(val_rows, bank, args.task, load_pred=load_pred)
+    train_ds = ManifestTokenDataset(train_rows, bank, args.task, pred_mode=pred_mode)
+    val_ds = ManifestTokenDataset(val_rows, bank, args.task, pred_mode=pred_mode)
     print(
         f"[{args.task} | {args.mode}] Train: {len(train_ds)}/{len(all_train_rows)} | "
         f"Val: {len(val_ds)}/{len(all_val_rows)} (Unseen: {subsets['unseen'].sum()}, Tail: {subsets['tail'].sum()})"
@@ -120,6 +132,17 @@ def main():
     prior_n_logits = torch.log(torch.tensor(priors["noun_output"], dtype=torch.float32) + 1e-8)
 
     model = FactorizedAttentiveProbe(mode=args.mode).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    config = {
+        **vars(args),
+        "parameters": int(total_params),
+        "trainable_parameters": int(trainable_params),
+        "train_events": len(train_ds),
+        "val_events": len(val_ds),
+    }
+    (out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    print(f"[{args.task} | {args.mode}] Params: {total_params:,} (trainable: {trainable_params:,})")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
