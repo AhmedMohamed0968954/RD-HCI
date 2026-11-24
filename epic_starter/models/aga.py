@@ -29,6 +29,7 @@ Memory pre-training (two stages):
      head on top of it, with the memory fine-tuned or frozen (freeze_memory=True).
 """
 from __future__ import annotations
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -278,19 +279,37 @@ class GatedAGAModel(nn.Module):
     keeps only some of ("history", "present", "future") for ablations: the others get weight 0.
     With the probe present encoder, the probe's logits stay the base prediction and the gated head
     adds to them.
+
+    Gate-collapse fixes (Member 4, all off by default):
+    branch_dropout  p: in training only, a row (with history available) loses, with probability p,
+                    the present branch, the future branch or both (one of the three at random), so
+                    the gate must also learn to use the history; history is never dropped and the
+                    probe's base logits are untouched. Evaluation always uses every branch.
+    gate_uncertainty: the gate also sees the normalised entropy of the frozen probe's verb and noun
+                    predictions [u_v, u_n] in [0, 1] (head built with extra_dim=2), so it can trust
+                    history / future more when the present clip is ambiguous.
     """
 
     BRANCHES = ("history", "present", "future")
 
     def __init__(self, memory: AGAMemoryModel, head: nn.Module, future_encoder: nn.Module | None = None,
-                 branches=BRANCHES):
+                 branches=BRANCHES, branch_dropout: float = 0.0, gate_uncertainty: bool = False):
         super().__init__()
         unknown = set(branches) - set(self.BRANCHES)
         if unknown or not branches:
             raise ValueError(f"branches must be a non-empty subset of {self.BRANCHES}, got {branches}")
         if memory.present_encoder == "none":
             raise ValueError("GatedAGAModel needs a present encoder (memory-only models have no present branch)")
+        if not 0.0 <= branch_dropout < 1.0:
+            raise ValueError(f"branch_dropout must be in [0, 1), got {branch_dropout}")
+        if gate_uncertainty and memory.present_encoder != "probe":
+            raise ValueError("gate_uncertainty needs the probe present encoder (its predictions)")
+        if getattr(head, "extra_dim", 0) != (2 if gate_uncertainty else 0):
+            raise ValueError("the head's extra_dim must be 2 with gate_uncertainty, else 0")
+        if getattr(future_encoder, "needs_obs", False) and memory.present_encoder != "probe":
+            raise ValueError("this future encoder reads the present clip's tokens: needs the probe present encoder")
         self.memory, self.head, self.future_encoder = memory, head, future_encoder
+        self.branch_dropout, self.gate_uncertainty = branch_dropout, gate_uncertainty
         self.branches = tuple(b for b in self.BRANCHES if b in branches)
         self.register_buffer("branch_mask", torch.tensor([b in branches for b in self.BRANCHES]),
                              persistent=False)
@@ -304,7 +323,10 @@ class GatedAGAModel(nn.Module):
         z = self.memory.encode(feats, valid, present_tokens, present_available)
         ref = z["verb_present"]
         if future is None and future_tokens is not None and self.future_encoder is not None:
-            future = self.future_encoder(future_tokens, future_available)
+            kw = {}
+            if getattr(self.future_encoder, "needs_obs", False):     # factorized_pred_1664: + present clip
+                kw["obs_tokens"] = present_tokens
+            future = self.future_encoder(future_tokens, future_available, **kw)
         if future is None:
             fv = fn = torch.zeros_like(ref)
             has_future = torch.zeros(ref.shape[0], dtype=torch.bool, device=ref.device)
@@ -314,14 +336,40 @@ class GatedAGAModel(nn.Module):
                           if future_available is None else future_available.bool())
         available = torch.stack([z["history_available"], z["present_available"], has_future], dim=1)
         available = available & self.branch_mask
+        if self.training and self.branch_dropout > 0:
+            available = drop_branches(available, self.branch_dropout)
+        extra = None
+        if self.gate_uncertainty:
+            extra = torch.stack([normalised_entropy(z["base_verb_logits"]),
+                                 normalised_entropy(z["base_noun_logits"])], dim=1)
+        kw = {} if extra is None else {"extra": extra}
         out = self.head((z["verb_history"], z["verb_present"], fv), (z["noun_history"], z["noun_present"], fn),
-                        available=available)
+                        available=available, **kw)
         if "base_verb_logits" in z:
             out["verb_logits"] = out["verb_logits"] + z["base_verb_logits"]
             out["noun_logits"] = out["noun_logits"] + z["base_noun_logits"]
         out.update({k: z[k] for k in ("aux_verb_logits", "aux_noun_logits", "attn", "attn_verb", "attn_noun")
                     if k in z})
         return out
+
+
+def drop_branches(available: torch.Tensor, p: float) -> torch.Tensor:
+    """Gate branch dropout (training only): each row whose history is available loses, with
+    probability p, its present branch, its future branch or both (uniformly one of the three).
+    History is never dropped, so every row keeps at least one branch."""
+    hit = (torch.rand(available.shape[0], device=available.device) < p) & available[:, 0]
+    choice = torch.randint(0, 3, (available.shape[0],), device=available.device)   # 0 P, 1 F, 2 both
+    out = available.clone()
+    out[:, 1] &= ~(hit & (choice != 1))
+    out[:, 2] &= ~(hit & (choice != 0))
+    return out
+
+
+def normalised_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Entropy of softmax(logits) divided by log(C): 0 = certain, 1 = uniform (also all-zero rows,
+    i.e. events without a present clip). Detached: the gate reads it, it is not trained through it."""
+    logp = torch.log_softmax(logits.detach().float(), dim=-1)
+    return -(logp.exp() * logp).sum(-1) / math.log(logits.shape[-1])
 
 
 def aga_loss(out, batch, aux_weight=0.5, verb_weight=None, noun_weight=None, label_smoothing=0.0):

@@ -55,8 +55,27 @@ def fusion_label(a):
     encoder = a.get("future_encoder", "none")
     kept = [b for b in a.get("branches", "history,present,future").split(",")
             if b.strip() and (b.strip() != "future" or encoder != "none")]
+    tokens = a.get("future_tokens") or "sta_pred_tokens.npy"
+    probe_mode = a.get("future_probe_mode") or "factorized_pred"
+    if encoder == "probe":              # the predictor file follows Member 2's probe mode
+        future = "probe" if probe_mode == "factorized_pred" else f"probe {probe_mode}"
+    else:
+        future = encoder if tokens == "sta_pred_tokens.npy" else f"{encoder}, {tokens}"
     return f"three_way {'+'.join(b.strip()[0].upper() for b in kept)}" + (
-        f" (future: {encoder})" if encoder != "none" else "")
+        f" (future: {future})" if encoder != "none" else "") + gate_fix_label(a)
+
+
+def gate_fix_label(a):
+    """Member 4's gate-collapse fixes as a label suffix, e.g. ' {gate: dropout 0.3, entropy 0.1,
+    uncertainty}'; '' when none is used (older runs keep their labels)."""
+    parts = []
+    if a.get("gate_dropout"):
+        parts.append(f"dropout {a['gate_dropout']:g}")
+    if a.get("gate_entropy"):
+        parts.append(f"entropy {a['gate_entropy']:g}")
+    if a.get("gate_uncertainty"):
+        parts.append("uncertainty")
+    return f" {{gate: {', '.join(parts)}}}" if parts else ""
 
 
 def memory_label(a):
