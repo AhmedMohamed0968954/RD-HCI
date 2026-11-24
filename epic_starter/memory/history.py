@@ -116,7 +116,8 @@ class HistoryDataset(Dataset):
     present_tokens: also return the full-token present clip (see module docstring).
     future: V-JEPA predictor tokens of the exact STA clip for Member 4's future branch, as an
     Anchors(..., tokens_file="sta_pred_tokens.npy") or a dict {narration_id: tokens}. Adds
-    "future_tokens" [T, D] and "future_available" (False: no clip, or an all-zero block).
+    "future_tokens" [T, D] and "future_available" (False: no clip, or an all-zero block). [T, D] is
+    the future file's own (Anchors.token_shape, e.g. 17 x 1664), or the bank's for a dict.
     step_bank / step_anchors: read the memory steps ("feats") from another bank with the same clips
     and times, e.g. Member 2's probe outputs per clip (probe_steps.py); the present clip still comes
     from `bank` / `anchors`.
@@ -128,6 +129,8 @@ class HistoryDataset(Dataset):
         self.events, self.bank, self.aux, self.anchors = list(events), bank, aux, anchors or {}
         self.steps, self.stride, self.tolerance = steps, stride, tolerance
         self.present_tokens, self.future = present_tokens, future
+        # predictor tokens may have their own [T, D] (e.g. 17 x 1664), else the bank's
+        self.future_shape = tuple(getattr(future, "token_shape", None) or bank.token_shape)
         self.step_bank, self.step_anchors = step_bank, step_anchors or {}
         missing = sorted({e.video_id for e in self.events if e.sta_cutoff >= 0 and e.video_id not in bank})
         if missing:
@@ -177,7 +180,7 @@ class HistoryDataset(Dataset):
                 present, source = torch.zeros(shape), 0
             item["present_tokens"], item["present_source"] = present, torch.tensor(source)
         if self.future is not None:
-            shape = self.bank.token_shape
+            shape = self.future_shape
             f = (self.future.for_event(e) if hasattr(self.future, "for_event")
                  else self.future.get(e.narration_id))
             ok = (f is not None and tuple(f.shape) == tuple(shape) and bool(torch.isfinite(f).all())

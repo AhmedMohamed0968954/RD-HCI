@@ -194,10 +194,12 @@ class Anchors:
     """
 
     def __init__(self, root: str | Path, pooled: bool = False, cache_dir: str | Path | None = None,
-                 tokens_file: str = "sta_obs_tokens.npy"):
+                 tokens_file: str = "sta_obs_tokens.npy", index_file: str = "events_index.csv"):
         self.root, self._array, self.rows, self.pooled = Path(root), None, {}, pooled
         self.tokens_file = tokens_file
-        with (self.root / "events_index.csv").open(newline="") as f:
+        # index_file="test_events_index.csv" with e.g. tokens_file="sta_pred_test_tokens.npy": the hidden
+        # test events, which scripts/extract_pred1664_and_test.py writes to separate files
+        with (self.root / index_file).open(newline="") as f:
             reader = csv.DictReader(f)
             if "sta_clip_end_s" not in (reader.fieldnames or []):
                 # Team format contract: an ambiguous legacy clip_end_s (AR stop or STA cutoff?)
@@ -213,6 +215,14 @@ class Anchors:
         if pooled:
             self._array = mean_tokens(np.load(self.root / tokens_file, mmap_mode="r"),
                                       cache_path(cache_dir, self.root, tokens_file))
+
+    @property
+    def token_shape(self) -> tuple:
+        """[T, D] of one event's block in tokens_file (e.g. (24, 1024), or (17, 1664) for a
+        predictor-only file); read from the .npy header, nothing is loaded."""
+        if self._array is not None and not self.pooled:
+            return tuple(self._array.shape[1:])
+        return tuple(np.load(self.root / self.tokens_file, mmap_mode="r").shape[1:])
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -231,6 +241,51 @@ class Anchors:
         if self._array is None:
             self._array = np.load(self.root / self.tokens_file, mmap_mode="r")
         return torch.from_numpy(np.array(self._array[row]))
+
+
+def test_tokens_file(tokens_file: str) -> str:
+    """Name of the hidden-test counterpart that scripts/extract_pred1664_and_test.py writes next to a
+    token file: sta_obs_tokens.npy -> sta_obs_test_tokens.npy, sta_pred_tokens.npy ->
+    sta_pred_test_tokens.npy, sta_pred17_1664.npy -> sta_pred17_1664_test.npy."""
+    stem = tokens_file[:-len(".npy")] if tokens_file.endswith(".npy") else tokens_file
+    if stem.endswith("_tokens"):
+        return stem[:-len("_tokens")] + "_test_tokens.npy"
+    return stem + "_test.npy"
+
+
+class AnchorsChain:
+    """Several Anchors read as one (e.g. training events + hidden test events kept in separate files):
+    same interface (rows, for_event, token_shape); every narration id must be in one part only."""
+
+    def __init__(self, *parts):
+        if not parts or len({tuple(p.token_shape) for p in parts}) != 1:
+            raise ValueError("AnchorsChain needs Anchors with the same token shape")
+        self.parts, self.rows, self._owner = parts, {}, {}
+        for i, part in enumerate(parts):
+            twice = self.rows.keys() & part.rows.keys()
+            if twice:
+                raise ValueError(f"{len(twice)} narration ids are in two token files, e.g. {sorted(twice)[:3]}")
+            self.rows.update(part.rows)
+            self._owner.update(dict.fromkeys(part.rows, i))
+
+    @property
+    def token_shape(self) -> tuple:
+        return tuple(self.parts[0].token_shape)
+
+    def for_event(self, event):
+        i = self._owner.get(event.narration_id)
+        return None if i is None else self.parts[i].for_event(event)
+
+
+def anchors_with_test(root: str | Path, tokens_file: str):
+    """Anchors for tokens_file, chained with its hidden-test counterpart (test_events_index.csv +
+    test_tokens_file(tokens_file)) when both exist in root; else the training-events Anchors alone."""
+    root = Path(root)
+    main = Anchors(root, tokens_file=tokens_file)
+    test_file = test_tokens_file(tokens_file)
+    if (root / "test_events_index.csv").is_file() and (root / test_file).is_file():
+        return AnchorsChain(main, Anchors(root, tokens_file=test_file, index_file="test_events_index.csv"))
+    return main
 
 
 def make_mock_bank(events, stride=1.0, tokens=24, dim=32, seed=0, encode_time=True) -> FeatureBank:

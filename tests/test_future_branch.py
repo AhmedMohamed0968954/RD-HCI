@@ -224,7 +224,206 @@ def test_frozen_member2_future_probe_is_not_trained(toy, tmp_path):
     ["--fusion", "three_way", "--future-encoder", "mean", "--no-anchor"],
     ["--fusion", "three_way", "--future-encoder", "mean", "--freeze-future"],
     ["--fusion", "three_way", "--future-encoder", "probe", "--freeze-future"],
+    # gate-collapse fixes and other predictor files
+    ["--gate-dropout", "0.3"],                                               # needs three_way
+    ["--gate-entropy", "0.1"],
+    ["--gate-uncertainty"],
+    ["--fusion", "three_way", "--gate-dropout", "1.0"],
+    ["--fusion", "three_way", "--gate-entropy", "-0.1"],
+    ["--fusion", "three_way", "--gate-uncertainty", "--present-encoder", "mean"],
+    ["--fusion", "three_way", "--future-encoder", "probe", "--future-tokens", "sta_pred17_1664.npy"],
 ])
 def test_inconsistent_options_are_refused(bad):
     with pytest.raises(SystemExit):
         script("train_sta_memory").parse_args(["--train-csv", "x.csv", "--out-dir", "o", *bad])
+
+
+# --- Member 4, Spec 5: gate-collapse fixes ------------------------------------------------------
+
+def test_gate_entropy_and_extra_gate_inputs():
+    from epic_starter.models.gate import ThreeWayGate, gate_entropy, mean_gate_entropy
+    w = torch.tensor([[1.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3], [0.5, 0.5, 0.0]])
+    assert torch.allclose(gate_entropy(w), torch.tensor([0.0, np.log(3), np.log(2)], dtype=torch.float32))
+    out = {"verb_gates": torch.tensor([[0.5, 0.5, 0.0], [0.0, 0.0, 0.0]]),        # 2nd row: prior only
+           "noun_gates": torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])}
+    assert torch.isclose(mean_gate_entropy(out), torch.tensor(np.log(2) / 2, dtype=torch.float32))
+    torch.manual_seed(0)
+    gate = ThreeWayGate(8, extra_dim=2)
+    x = [torch.randn(4, 8) for _ in range(3)]
+    fused, w = gate(*x, extra=torch.rand(4, 2))
+    assert fused.shape == (4, 8) and torch.allclose(w.sum(1), torch.ones(4))
+    assert not torch.allclose(gate(*x, extra=torch.zeros(4, 2))[1], gate(*x, extra=torch.ones(4, 2))[1])
+    with pytest.raises(ValueError):
+        gate(*x)                                                    # extra inputs are required
+    with pytest.raises(ValueError):
+        ThreeWayGate(8)(*x, extra=torch.rand(4, 2))                # and refused without extra_dim
+
+
+def test_branch_dropout_drops_present_or_future_never_history():
+    from epic_starter.models.aga import drop_branches
+    torch.manual_seed(0)
+    avail = torch.ones(3000, 3, dtype=torch.bool)
+    avail[:1000, 0] = False                                         # no history: never dropped
+    out = drop_branches(avail, 0.6)
+    assert out[:, 0].equal(avail[:, 0]) and out[:1000].equal(avail[:1000])
+    lost_p, lost_f = ~out[1000:, 1], ~out[1000:, 2]
+    share = (lost_p | lost_f).float().mean().item()
+    assert 0.55 < share < 0.65                                      # p of the rows with history
+    for kind in (lost_p & ~lost_f, lost_f & ~lost_p, lost_p & lost_f):   # P only, F only, both
+        assert 0.15 < kind.float().mean().item() < 0.25
+    assert drop_branches(avail, 0.0).equal(avail)
+    # in the model: only in training, never at evaluation
+    torch.manual_seed(0)
+    model = GatedAGAModel(AGAMemoryModel(feat_dim=16, d=16, heads=2), GatedVerbNounHead(in_dim=16),
+                          future_encoder=FutureBranch(16, 16), branch_dropout=0.9)
+    args = (torch.randn(64, 5, 1, 16), torch.ones(64, 5, dtype=torch.bool))
+    kw = dict(future_tokens=torch.randn(64, 24, 16), future_available=torch.ones(64, dtype=torch.bool))
+    assert (model.eval()(*args, **kw)["verb_gates"] > 0).all()
+    w = model.train()(*args, **kw)["verb_gates"]
+    assert (w[:, 0] > 0).all() and ((w[:, 1] == 0) | (w[:, 2] == 0)).float().mean() > 0.5
+    with pytest.raises(ValueError):
+        GatedAGAModel(AGAMemoryModel(feat_dim=16, d=16, heads=2), GatedVerbNounHead(in_dim=16), branch_dropout=1.0)
+
+
+def test_gate_reads_the_probe_uncertainty():
+    from epic_starter.models.aga import normalised_entropy
+    assert torch.allclose(normalised_entropy(torch.zeros(2, 97)), torch.ones(2))     # no clip: uniform
+    assert normalised_entropy(torch.tensor([[50.0] + [0.0] * 299])).item() < 0.01
+    torch.manual_seed(0)
+    memory = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="probe")
+    model = GatedAGAModel(memory, GatedVerbNounHead(in_dim=16, extra_dim=2), gate_uncertainty=True).eval()
+    out = model(torch.randn(3, 5, 1, 16), torch.ones(3, 5, dtype=torch.bool), torch.randn(3, 24, 16),
+                torch.tensor([True, False, True]))
+    assert out["verb_logits"].shape == (3, 97) and torch.isfinite(out["verb_gates"]).all()
+    with pytest.raises(ValueError):                                  # head without the extra inputs
+        GatedAGAModel(memory, GatedVerbNounHead(in_dim=16), gate_uncertainty=True)
+    with pytest.raises(ValueError):                                  # mean present encoder: no probe
+        GatedAGAModel(AGAMemoryModel(feat_dim=16, d=16, heads=2), GatedVerbNounHead(in_dim=16, extra_dim=2),
+                      gate_uncertainty=True)
+
+
+def test_training_with_gate_fixes(toy):
+    s, out = run(toy, "hpf_fix", "--fusion", "three_way", "--future-encoder", "mean", "--gate-dropout", "0.5",
+                 "--gate-entropy", "0.1", "--gate-uncertainty")
+    assert 0 <= s["best_val_action_mt5r"] <= 100
+    ckpt = torch.load(out / "best.pt", weights_only=False)
+    assert ckpt["gate"] == {"dropout": 0.5, "entropy": 0.1, "uncertainty": True}
+    assert ckpt["state_dict"]["head.verb_gate.score.0.weight"].shape[1] == 3 * 16 + 2
+    val = np.load(out / "val_outputs.npz")
+    g = val["verb_gates"]
+    hist, pres = val["step_valid"][:, :-1].any(1), val["present_source"] > 0
+    assert hist.any() and pres.any()
+    assert (g[hist, 0] > 0).all() and (g[pres, 1] > 0).all()       # evaluation: no branch dropped
+    run(toy, "hpf_plain", "--fusion", "three_way", "--future-encoder", "mean")
+    summary = script("member4_gate_summary").main(["--runs-dir", str(toy / "runs"), "--steps", "4", "--any-present",
+                                                   "--out", str(toy / "m4" / "fix.md"),
+                                                   "--reference", "three_way H+P+F (future: mean)"])
+    rows = {e["label"]: e for e in summary}
+    fixed = "three_way H+P+F (future: mean) {gate: dropout 0.5, entropy 0.1, uncertainty}"
+    assert set(rows) == {"three_way H+P+F (future: mean)", fixed}
+    assert rows[fixed]["delta_vs_HP"][2] == 1 and rows["three_way H+P+F (future: mean)"]["delta_vs_HP"][2] == 0
+
+
+def test_predictor_only_token_file_with_its_own_shape(toy):
+    """Member 2's strict-future file (e.g. sta_pred17_1664.npy [N, 17, 1664]): its own token count and
+    width, same rows and leakage check; the mean encoder averages all its tokens."""
+    n = np.load(toy / "f16" / "sta_pred_tokens.npy", mmap_mode="r").shape[0]
+    rng = np.random.default_rng(1)
+    np.save(toy / "f16" / "sta_pred17.npy", rng.standard_normal((n, 17, 12)).astype(np.float16))
+    assert Anchors(toy / "f16", tokens_file="sta_pred17.npy").token_shape == (17, 12)
+    branch = FutureBranch(12, 8, encoder="mean", n_tokens=17)
+    x = torch.randn(2, 17, 12)
+    y = x.clone()
+    y[:, 0] += torch.randn(12)                                      # every token is predicted: all count
+    assert not torch.allclose(branch(x)[0], branch(y)[0])
+    with pytest.raises(ValueError):
+        FutureBranch(12, 8, encoder="probe", n_tokens=17)
+    with pytest.raises(ValueError):
+        branch(torch.randn(2, 24, 12))
+    s, out = run(toy, "hpf17", "--fusion", "three_way", "--future-encoder", "mean",
+                 "--future-tokens", "sta_pred17.npy")
+    state = torch.load(out / "best.pt", weights_only=False)["state_dict"]
+    assert state["future_encoder.proj_v.1.weight"].shape == (16, 12)
+    val = np.load(out / "val_outputs.npz")
+    assert val["future_available"].any() and (val["verb_gates"][val["future_available"].astype(bool), 2] > 0).all()
+    label = script("report_sta_memory").fusion_label(json.loads((out / "config.json").read_text())["args"])
+    assert label == "three_way H+P+F (future: mean, sta_pred17.npy)"
+
+
+# --- Member 2's hybrid probes (pred_17_only, factorized_pred_1664) and hidden-test token files -----
+
+@pytest.mark.parametrize("mode", ["pred_17_only", "factorized_pred_1664"])
+def test_probe_encoder_follows_member2_hybrid_pathways(tmp_path, mode):
+    probe = pred_probe_checkpoint(tmp_path / "p.pt", mode=mode)
+    branch = FutureBranch(1664, 8, encoder="probe", freeze_probe=True, n_tokens=17, probe_mode=mode, embed_dim=16)
+    assert branch.load_probe(tmp_path / "p.pt") == (3, 7.23) and branch.needs_obs == (mode == "factorized_pred_1664")
+    if mode == "factorized_pred_1664":                       # Member 2's obs/pred gate forced to the pred side
+        with torch.no_grad():
+            for gate in (probe.gate_v, probe.gate_n):
+                gate.weight.zero_()
+                gate.bias.copy_(torch.tensor([-1e4, 1e4]))
+    branch.eval()
+    obs, pred = torch.randn(4, 24, 16), torch.randn(4, 17, 1664)
+    ref_v, ref_n = probe.encode_tokens(obs, pred_tokens=pred)
+    got_v, got_n = branch.pooled(pred, obs)
+    assert torch.allclose(got_v, ref_v, atol=1e-5) and torch.allclose(got_n, ref_n, atol=1e-5)
+    if mode == "pred_17_only":                                # strict future: the observed clip is not read
+        assert torch.allclose(branch.pooled(pred, torch.randn(4, 24, 16))[0], got_v)
+    else:
+        with pytest.raises(ValueError):
+            branch.pooled(pred)                               # needs the present clip's tokens
+    fv, _ = branch(pred, torch.tensor([True, False, True, True]), obs_tokens=obs)
+    assert torch.equal(fv[1], torch.zeros(8))
+    with pytest.raises(ValueError):                           # another mode's checkpoint
+        FutureBranch(16, 8, encoder="probe").load_probe(tmp_path / "p.pt")
+    with pytest.raises(ValueError):                           # 17 x 1664 tokens only
+        FutureBranch(16, 8, encoder="probe", n_tokens=24, probe_mode=mode)
+
+
+def test_hidden_test_events_come_from_their_own_token_files(tmp_path):
+    from epic_starter.memory.bank import AnchorsChain, anchors_with_test, test_tokens_file
+    assert test_tokens_file("sta_pred_tokens.npy") == "sta_pred_test_tokens.npy"
+    assert test_tokens_file("sta_obs_tokens.npy") == "sta_obs_test_tokens.npy"
+    assert test_tokens_file("sta_pred17_1664.npy") == "sta_pred17_1664_test.npy"
+    events = [Event("a", "P01", "P01_01", 12.0, 13.0, 11.0, 1, 2)]
+    write_mock_consolidated(events, tmp_path, tokens=24, dim=4)
+    assert isinstance(anchors_with_test(tmp_path, "sta_pred_tokens.npy"), Anchors)   # no test files yet
+    test = [Event("t0", "P09", "P09_01", 8.0, 9.0, 7.0, None, None), Event("t1", "P09", "P09_01", 0.5, 1.5, -0.5, None, None)]
+    with open(tmp_path / "test_events_index.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["row", "narration_id", "video_id", "sta_clip_end_s"])
+        w.writerow([0, "t0", "P09_01", "7.000000"])
+        w.writerow([1, "t1", "P09_01", "-1.0"])            # no observable frame
+    test_tokens = np.random.default_rng(0).standard_normal((2, 24, 4)).astype(np.float16)
+    np.save(tmp_path / "sta_pred_test_tokens.npy", test_tokens)
+    chain = anchors_with_test(tmp_path, "sta_pred_tokens.npy")
+    assert isinstance(chain, AnchorsChain) and chain.token_shape == (24, 4)
+    assert torch.equal(chain.for_event(test[0]), torch.from_numpy(test_tokens[0]))
+    assert chain.for_event(test[1]) is None and chain.for_event(events[0]) is not None
+    with pytest.raises(AssertionError):                       # the same leakage check for test events
+        chain.for_event(Event("t0", "P09", "P09_01", 7.5, 8.5, 6.5, None, None))
+    with pytest.raises(ValueError):                           # an event in both files
+        AnchorsChain(Anchors(tmp_path, tokens_file="sta_pred_tokens.npy"),
+                     Anchors(tmp_path, tokens_file="sta_pred_tokens.npy"))
+
+
+def test_training_with_member2_pred17_probe(toy, tmp_path):
+    n = np.load(toy / "f16" / "sta_pred_tokens.npy", mmap_mode="r").shape[0]
+    np.save(toy / "f16" / "sta_pred17_1664.npy",
+            np.random.default_rng(2).standard_normal((n, 17, 1664)).astype(np.float16))
+    probe = pred_probe_checkpoint(tmp_path / "p17.pt", mode="pred_17_only")
+    _, out = run(toy, "hpf_p17", "--fusion", "three_way", "--future-encoder", "probe",
+                 "--future-init", str(tmp_path / "p17.pt"), "--freeze-future", "--gate-dropout", "0.3")
+    cfg = json.loads((out / "config.json").read_text())["args"]
+    assert cfg["future_probe_mode"] == "pred_17_only" and cfg["future_tokens"] == "sta_pred17_1664.npy"
+    state = torch.load(out / "best.pt", weights_only=False)["state_dict"]
+    for k, v in probe.state_dict().items():
+        assert torch.equal(state[f"future_encoder.probe.{k}"], v), k
+    val = np.load(out / "val_outputs.npz")
+    assert (val["verb_gates"][val["future_available"].astype(bool), 2] > 0).all()
+    label = script("report_sta_memory").fusion_label(cfg)
+    assert label == "three_way H+P+F (future: probe pred_17_only) {gate: dropout 0.3}"
+    pred_probe_checkpoint(tmp_path / "p1664.pt", mode="factorized_pred_1664")
+    _, out = run(toy, "hpf_p1664", "--fusion", "three_way", "--future-encoder", "probe",
+                 "--future-init", str(tmp_path / "p1664.pt"), "--freeze-future")
+    assert json.loads((out / "config.json").read_text())["args"]["future_probe_mode"] == "factorized_pred_1664"

@@ -50,6 +50,9 @@ from epic_starter.epic_metrics import evaluate, validate_predictions
 from epic_starter.memory import Anchors, AuxLabeler, FeatureBank, HistoryDataset, make_mock_bank
 from epic_starter.models.aga import N_NOUN, N_VERB, AGAMemoryModel, GatedAGAModel, aga_loss
 from epic_starter.models.future_branch import ENCODERS as FUTURE_ENCODERS     # Member 4
+from epic_starter.models.future_branch import PROBE_TOKENS_FILE, probe_mode_of  # Member 4
+from epic_starter.memory.bank import AnchorsChain, anchors_with_test            # Member 4
+from epic_starter.models.gate import mean_gate_entropy                          # Member 4
 
 BRANCHES = GatedAGAModel.BRANCHES
 
@@ -99,11 +102,26 @@ def parse_args(argv=None):
                         "'present,future'; the others get gate weight 0 (ablation)")
     m.add_argument("--future-encoder", choices=["none", *FUTURE_ENCODERS], default="none",
                    help="three_way only (Member 4): future branch from the V-JEPA predictor tokens. "
-                        "mean: mean of the 17 predictor-only tokens; probe: the predictor pathway of "
-                        "Member 2's STA factorized_pred probe (see --future-init)")
-    m.add_argument("--future-init", help="Member 2's STA factorized_pred probe checkpoint (best.pt) for "
-                                         "--future-encoder probe")
+                        "mean: mean of the predictor-only tokens; probe: the predictor pathway of one of "
+                        "Member 2's STA probes (factorized_pred, pred_17_only, factorized_pred_1664; "
+                        "see --future-init)")
+    m.add_argument("--future-init", help="Member 2's STA probe checkpoint (best.pt) for --future-encoder probe; "
+                                         "its mode picks the pathway and the predictor file")
     m.add_argument("--freeze-future", action="store_true", help="keep the initialised future probe fixed")
+    m.add_argument("--future-tokens",
+                   help="--future-encoder mean: predictor token file in --features-dir (default "
+                        "sta_pred_tokens.npy; e.g. sta_pred17_1664.npy [N, 17, 1664]). With probe the file "
+                        "follows the probe's mode. Hidden-test events are read from the matching *_test file "
+                        "+ test_events_index.csv when they exist")
+    g = p.add_argument_group("three-way gate collapse fixes (Member 4, --fusion three_way)")
+    g.add_argument("--gate-dropout", type=float, default=0.0,
+                   help="training only: probability that a row loses its present branch, its future branch "
+                        "or both (one at random) in the gate; history is never dropped")
+    g.add_argument("--gate-entropy", type=float, default=0.0,
+                   help="lambda: adds -lambda * mean gate entropy to the loss (rewards using several branches)")
+    g.add_argument("--gate-uncertainty", action="store_true",
+                   help="the gate also reads the normalised entropy of the frozen probe's verb / noun "
+                        "predictions (needs --present-encoder probe)")
     t = p.add_argument_group("training")
     t.add_argument("--epochs", type=int, default=40)
     t.add_argument("--patience", type=int, default=8, help="stop after N epochs without improvement")
@@ -149,6 +167,17 @@ def parse_args(argv=None):
         p.error("--future-init / --freeze-future need --future-encoder probe")
     if a.freeze_future and not a.future_init:
         p.error("--freeze-future needs --future-init")
+    if a.future_tokens and a.future_encoder != "mean":
+        p.error("--future-tokens is for --future-encoder mean (with probe the file follows the probe's mode)")
+    gate_fix = a.gate_dropout > 0 or a.gate_entropy > 0 or a.gate_uncertainty
+    if gate_fix and a.fusion != "three_way":
+        p.error("--gate-dropout / --gate-entropy / --gate-uncertainty need --fusion three_way")
+    if not 0.0 <= a.gate_dropout < 1.0:
+        p.error("--gate-dropout must be in [0, 1)")
+    if a.gate_entropy < 0:
+        p.error("--gate-entropy must be >= 0")
+    if a.gate_uncertainty and a.present_encoder != "probe":
+        p.error("--gate-uncertainty needs --present-encoder probe")
     return a
 
 
@@ -373,9 +402,20 @@ def main(argv=None):
     T, D = bank.shape
     D = bank.token_shape[1]
     future_src = None                   # Member 4: predictor tokens of the exact STA clip
+    a.future_probe_mode = None
+    if a.future_encoder == "probe":     # Member 2's probe mode decides the pathway and the predictor file
+        a.future_probe_mode = probe_mode_of(a.future_init) if a.future_init else "factorized_pred"
+        if a.future_probe_mode not in PROBE_TOKENS_FILE:
+            raise ValueError(f"{a.future_init}: mode {a.future_probe_mode!r} has no predictor pathway; "
+                             f"expected one of {tuple(PROBE_TOKENS_FILE)}")
+        a.future_tokens = PROBE_TOKENS_FILE[a.future_probe_mode]
+    elif a.future_encoder == "mean":
+        a.future_tokens = a.future_tokens or "sta_pred_tokens.npy"
     if a.future_encoder != "none":
-        if a.features_dir:
-            future_src = Anchors(a.features_dir, tokens_file="sta_pred_tokens.npy")
+        if a.features_dir:              # training events + hidden-test events (separate files) when present
+            future_src = anchors_with_test(a.features_dir, a.future_tokens)
+            print(f"future branch: {a.future_tokens} {list(future_src.token_shape)}"
+                  + (" + hidden-test file" if isinstance(future_src, AnchorsChain) else ""), flush=True)
         else:                           # mock run: random predictor tokens from their own generator
             g = torch.Generator().manual_seed(a.seed + 1)
             future_src = {e.narration_id: torch.randn(*bank.token_shape, generator=g)
@@ -437,14 +477,18 @@ def main(argv=None):
         future_encoder = None
         if a.future_encoder != "none":
             from epic_starter.models.future_branch import FutureBranch
-            future_encoder = FutureBranch(D, a.d_model, encoder=a.future_encoder, freeze_probe=a.freeze_future)
+            n_f, d_f = getattr(future_src, "token_shape", None) or bank.token_shape
+            future_encoder = FutureBranch(d_f, a.d_model, encoder=a.future_encoder, freeze_probe=a.freeze_future,
+                                          n_tokens=n_f, probe_mode=a.future_probe_mode or "factorized_pred",
+                                          embed_dim=D)
             if a.future_init:
                 epoch_f, score_f = future_encoder.load_probe(a.future_init)
                 future_init = {"path": a.future_init, "epoch": epoch_f, "val_action_mt5r": score_f}
                 print(f"future probe initialised from {a.future_init} (its val action MT5R: {score_f})",
                       flush=True)
-        model = GatedAGAModel(model, GatedVerbNounHead(in_dim=a.d_model), future_encoder=future_encoder,
-                              branches=parse_branches(a.branches))
+        head = GatedVerbNounHead(in_dim=a.d_model, extra_dim=2 if a.gate_uncertainty else 0)
+        model = GatedAGAModel(model, head, future_encoder=future_encoder, branches=parse_branches(a.branches),
+                              branch_dropout=a.gate_dropout, gate_uncertainty=a.gate_uncertainty)
     model = model.to(device)
     wv, wn = class_weights(train, a.class_weights)
     wv, wn = (wv.to(device) if wv is not None else None), (wn.to(device) if wn is not None else None)
@@ -481,7 +525,10 @@ def main(argv=None):
         t0, losses = time.time(), []
         for b in loaders["train"]:
             b = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
-            loss = aga_loss(run_model(model, b, device), b, a.aux_weight, wv, wn, a.label_smoothing)
+            r = run_model(model, b, device)
+            loss = aga_loss(r, b, a.aux_weight, wv, wn, a.label_smoothing)
+            if a.gate_entropy > 0:              # Member 4: reward spreading the gate over branches
+                loss = loss - a.gate_entropy * mean_gate_entropy(r)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -502,6 +549,9 @@ def main(argv=None):
             best, best_epoch, waited = score, epoch, 0
             torch.save({"state_dict": model.state_dict(), "ctor": ctor, "fusion": a.fusion, "epoch": epoch,
                         "branches": parse_branches(a.branches), "future_encoder": a.future_encoder,
+                        "future_tokens": a.future_tokens, "future_probe_mode": a.future_probe_mode,
+                        "gate": {"dropout": a.gate_dropout, "entropy": a.gate_entropy,
+                                 "uncertainty": a.gate_uncertainty},
                         "val_action_mt5r": score}, out / "best.pt")
         else:
             waited += 1

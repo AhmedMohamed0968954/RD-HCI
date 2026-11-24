@@ -66,8 +66,8 @@ def load(runs_dir: Path, steps: int, any_present: bool = False):
             continue                      # same present encoder and clips as the gate rows only
         memory = memory_label(a)
         label = fusion_label(a) + ("" if memory == "scratch" else f" [memory {memory}]")
-        if label not in ORDER:
-            continue
+        if label not in ORDER and not label.startswith("three_way"):
+            continue                      # every three-way setting (gate fixes, other memories) is kept
         row = {"run": run.name, "label": label, "seed": a["seed"], "best_epoch": m["best_epoch"],
                "seconds": round(sum(h.get("seconds", 0) for h in m.get("history", [])))}
         row.update(scores(m["best_val"], m.get("best_val_breakdown")))
@@ -113,22 +113,25 @@ def fmt(m, s, n):
     return f"{m:.2f} ± {s:.2f}" if n > 1 else f"{m:.2f}"
 
 
-def summarise(runs):
+def summarise(runs, reference=REFERENCE):
+    """reference: the label each row is compared with, same seed (default: history + present,
+    memory from scratch); e.g. the frozen pre-trained three-way row for the gate-fix runs."""
     by = defaultdict(list)
     for r in runs:
         by[r["label"]].append(r)
-    ref = {r["seed"]: r for r in by.get(REFERENCE, [])}
+    ref = {r["seed"]: r for r in by.get(reference, [])}
     table = []
-    for label in [x for x in ORDER if x in by]:
+    labels = [x for x in ORDER if x in by] + sorted(x for x in by if x not in ORDER)
+    for label in labels:
         rows = sorted(by[label], key=lambda r: r["seed"])
-        entry = {"label": label, "description": DESCRIPTION[label], "seeds": [r["seed"] for r in rows],
+        entry = {"label": label, "description": DESCRIPTION.get(label, label), "seeds": [r["seed"] for r in rows],
                  "runs": [r["run"] for r in rows]}
         for key in ("action_mt5r", "verb_mt5r", "noun_mt5r", "unseen", "tail"):
             entry[key] = mean_std(r.get(key) for r in rows)
         deltas = [r["action_mt5r"] - ref[r["seed"]]["action_mt5r"] for r in rows if r["seed"] in ref]
-        entry["delta_vs_HP"] = mean_std(deltas) if label != REFERENCE else (None, None, 0)
+        entry["delta_vs_HP"] = mean_std(deltas) if label != reference else (None, None, 0)
         entry["delta_vs_HP_per_seed"] = {r["seed"]: round(r["action_mt5r"] - ref[r["seed"]]["action_mt5r"], 2)
-                                         for r in rows if r["seed"] in ref and label != REFERENCE}
+                                         for r in rows if r["seed"] in ref and label != reference}
         for field in ("verb", "noun"):
             for key in (f"{field}_gates", f"{field}_gates_with_future"):
                 gs = [r[key] for r in rows if key in r]
@@ -139,10 +142,11 @@ def summarise(runs):
     return table
 
 
-def markdown(table, runs_dir):
+def markdown(table, runs_dir, reference=REFERENCE):
     lines = [f"Runs: `{runs_dir}` (decoupled memory, S = 16, frozen STA probe as present encoder; "
-             "validation split_seed42; mean ± std over seeds).", "",
-             "| Gate branches | Seeds | Action MT5R | Δ vs H+P (same seed) | Verb MT5R | Noun MT5R | "
+             "mean ± std over seeds). Δ: against the same seed of the reference row "
+             f"`{reference}`.", "",
+             "| Gate branches | Seeds | Action MT5R | Δ vs reference (same seed) | Verb MT5R | Noun MT5R | "
              "Unseen action | Tail action |",
              "|---|---|---|---|---|---|---|---|"]
     for e in table:
@@ -167,12 +171,14 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=16)
     p.add_argument("--any-present", action="store_true",
                    help="also keep runs with another present encoder (tests / exploratory runs)")
+    p.add_argument("--reference", default=REFERENCE,
+                   help="label of the row the others are compared with, same seed (default: '%(default)s')")
     a = p.parse_args(argv)
     runs = load(Path(a.runs_dir), a.steps, a.any_present)
-    table = summarise(runs)
+    table = summarise(runs, a.reference)
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    text = markdown(table, a.runs_dir)
+    text = markdown(table, a.runs_dir, a.reference)
     out.write_text(text)
     out.with_suffix(".json").write_text(json.dumps({"table": table, "runs": runs}, indent=2))
     print(text)

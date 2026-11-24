@@ -93,13 +93,59 @@ files; `val_outputs.npz` also holds `future_available` and the gate weights, so
 `member4_gate_summary.py` reports the mean weight per branch next to the scores. The comparison
 that matters is the change against H+P **with the same seed**.
 
+## Gate-collapse fixes (team plan, Spec 5)
+
+In every gate ablation the gate put about 1.0 of its weight on one branch (present, or future with
+Member 2's pooling): the branch with the lowest residual loss at the start wins and the others stop
+getting gradient. Three options of `train_sta_memory.py --fusion three_way` (all off by default; the
+probe's base logits stay outside the gate, untouched):
+
+| Option | What it does |
+|---|---|
+| `--gate-dropout p` | training only: a row with history loses, with probability p, its present branch, its future branch or both (one of the three at random). History is never dropped, so the gate must learn to use it; this also trains the H+P fallback for test events without predictor tokens. |
+| `--gate-entropy λ` | adds −λ × (mean gate entropy, verb and noun) to the loss: a spread-out gate costs less. |
+| `--gate-uncertainty` | the gate also reads the normalised entropy of the frozen probe's verb and noun predictions, [u_v, u_n] in [0, 1], so it can lean on history / future when the present clip is ambiguous. |
+
+The history branch is warm-started with Member 3's options (`--memory-init <..._psteps_memonly>/best.pt
+--freeze-memory --step-features <probe steps>`).
+
+**Member 2's hybrid-v3 probes as the future branch.** `--future-encoder probe --future-init <best.pt>`
+reads the checkpoint's mode and uses that probe's own predictor pathway and token file:
+
+| Member 2's probe | Predictor tokens | Pathway in `FutureBranch` |
+|---|---|---|
+| `factorized_pred` | `sta_pred_tokens.npy` [24, 1024] | pred pools + `ln_pred_*` |
+| `pred_17_only` | `sta_pred17_1664.npy` [17, 1664] | `pred_teacher_proj` + pred pools + `norm_*` (strict future) |
+| `factorized_pred_1664` | `sta_pred17_1664.npy` [17, 1664] + 7 observed tokens of the present clip | `obs_ctx_adapter` + `pred_teacher_proj` + pred pools + `ln_pred_*` |
+
+Hidden-test events are read from the matching test files (`test_events_index.csv` +
+`sta_pred_test_tokens.npy` / `sta_pred17_1664_test.npy`, from `scripts/extract_pred1664_and_test.py`)
+with the same leakage check, so the future branch is available on the hidden test too.
+`--future-encoder mean --future-tokens <file>` averages any predictor-only file.
+
+`scripts/member4_gate_fix.slurm` runs ten rows per seed on the hybrid-v3 split (memory seed s with
+Member 2's probe seed s): the factorized_pred future branch without fix, with each fix and with all
+three; history + present with all three; pred_17_only and factorized_pred_1664 without and with all
+three fixes. It needs Member 3's hybrid-v3 probe steps and stage-1 memories (paths in its header).
+
+```bash
+for s in 42 1 2; do
+  sbatch -A "$EPIC_ACCOUNT" -o "$EPIC_PROJECT/logs/m4-fix-%A_%a.out" scripts/member4_gate_fix.slurm $s
+done
+python scripts/member4_gate_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory_hybrid-v3" \
+    --out "$EPIC_TEAM/results/member4/gate_fix.md" \
+    --reference "three_way H+P+F (future: probe) [memory probe steps, pre-trained (frozen)]"
+```
+
 ## Limits and future work
 
-- **Hidden test.** Predictor tokens exist only for the 67,217 training events. On the hidden test
-  the future branch is unavailable and the gated model falls back to history + present.
-  Extracting predictor tokens for the test events is future work (Member 2's extractor can do it).
+- **Hidden test.** Since 22/11 Member 2 also extracts the hidden-test events (separate `*_test*`
+  files); the future branch reads them. The present branch still reads only `sta_obs_tokens.npy`, so
+  on the hidden test it falls back to the last bank clip until the present anchors also read
+  `sta_obs_test_tokens.npy` (Member 3's predict-only mode); `factorized_pred_1664` takes its 7
+  observed tokens from that same present clip.
 - The gate is trained with the future branch available for almost every event; if test events
-  stay without it, training with random branch dropout would match the two conditions.
+  stay without it, `--gate-dropout` (above) trains the history + present fallback as well.
 - Only one horizon (1 s after the cutoff, i.e. the action start) and one backbone (V-JEPA 2.1
   ViT-L/384, selected by the team) are tested. Several horizons, or a predictor in the encoder's
   own feature space, would allow a direct fidelity check, which this project does not do.
@@ -112,8 +158,9 @@ that matters is the change against H+P **with the same seed**.
 | Three-way gate and verb/noun head | `epic_starter/models/gate.py` | `tests/test_gate.py` |
 | Future branch | `epic_starter/models/future_branch.py` | `tests/test_future_branch.py` |
 | Wiring (gate inputs, branch mask) | `GatedAGAModel` in `epic_starter/models/aga.py`, `HistoryDataset(future=...)` | `tests/test_future_branch.py` |
-| Training options | `scripts/train_sta_memory.py` (`--future-encoder`, `--future-init`, `--freeze-future`, `--branches`) | `tests/test_future_branch.py` |
-| Ablation job and summary | `scripts/member4_gate_ablation.slurm`, `scripts/member4_gate_summary.py` | `tests/test_future_branch.py` |
+| Training options | `scripts/train_sta_memory.py` (`--future-encoder`, `--future-init`, `--freeze-future`, `--future-tokens`, `--branches`, `--gate-dropout`, `--gate-entropy`, `--gate-uncertainty`) | `tests/test_future_branch.py` |
+| Gate-collapse fixes | `drop_branches`, `normalised_entropy` in `aga.py`; `gate_entropy`, `mean_gate_entropy`, `extra_dim` in `gate.py` | `tests/test_future_branch.py` |
+| Ablation jobs and summary | `scripts/member4_gate_ablation.slurm`, `scripts/member4_gate_fix.slurm`, `scripts/member4_gate_summary.py` (`--reference`) | `tests/test_future_branch.py` |
 | Encoder + predictor in one pass | `epic_starter/models/future_latent.py` (`anticipate`) | `tests/test_future_latent.py` |
 | Predictor feasibility check | `scripts/predictor_feasibility.py`, `scripts/member4_feasibility.slurm` | `tests/test_future_latent.py` |
 | Synthetic gate demo | `scripts/gate_demo.py` | |
