@@ -232,6 +232,7 @@ def run_extract(args):
                 video_id=r["video_id"],
                 start=float(r["start"]),
                 stop=float(r["stop"]),
+                sta_cutoff=float(r["sta_cutoff"]),
                 verb=r.get("verb"),
                 noun=r.get("noun"),
             )
@@ -271,66 +272,81 @@ def run_consolidate(args):
     shard_dir = out_root / "shards_pred1664_test"
     m_dir = Path(args.manifest_dir)
 
-    # 1. Align train/val sta_pred17_1664.npy 1-to-1 with existing events_index.csv
     ev_idx = pd.read_csv(out_root / "events_index.csv")
     row_map = dict(zip(ev_idx["narration_id"], ev_idx["row"]))
     n_trainval = len(ev_idx)
-    p17_tv = np.lib.format.open_memmap(
-        out_root / "sta_pred17_1664.npy", mode="w+", dtype=np.float16, shape=(n_trainval, 17, 1664)
-    )
+    p17_tv = np.zeros((n_trainval, 17, 1664), dtype=np.float16)
     filled_tv = np.zeros(n_trainval, dtype=bool)
 
-    # 2. Align test arrays 1-to-1 with manifests/hybrid-v3/test_sta.jsonl
     test_rows = read_manifest(m_dir / "test_sta.jsonl")
     test_map = {r["narration_id"]: i for i, r in enumerate(test_rows)}
     n_test = len(test_rows)
-    ar_test = np.lib.format.open_memmap(out_root / "ar_test_tokens.npy", mode="w+", dtype=np.float16, shape=(n_test, 24, 1024))
-    obs_test = np.lib.format.open_memmap(out_root / "sta_obs_test_tokens.npy", mode="w+", dtype=np.float16, shape=(n_test, 24, 1024))
-    pred_test = np.lib.format.open_memmap(out_root / "sta_pred_test_tokens.npy", mode="w+", dtype=np.float16, shape=(n_test, 24, 1024))
-    p17_test = np.lib.format.open_memmap(out_root / "sta_pred17_1664_test.npy", mode="w+", dtype=np.float16, shape=(n_test, 17, 1664))
+    ar_test = np.zeros((n_test, 24, 1024), dtype=np.float16)
+    obs_test = np.zeros((n_test, 24, 1024), dtype=np.float16)
+    pred_test = np.zeros((n_test, 24, 1024), dtype=np.float16)
+    p17_test = np.zeros((n_test, 17, 1664), dtype=np.float16)
     test_ar_end = np.full(n_test, -1.0, dtype=np.float64)
     test_sta_end = np.full(n_test, -1.0, dtype=np.float64)
     test_use_prior = np.ones(n_test, dtype=bool)
     filled_test = np.zeros(n_test, dtype=bool)
 
     shards = sorted(shard_dir.glob("*.npz"))
-    print(f"Consolidating {len(shards)} shards...")
-    for sp in shards:
-        d = np.load(sp, allow_pickle=False)
-        nids = d["narration_id"]
-        is_test = d["is_test"]
-        for i, nid in enumerate(nids):
-            nid_s = str(nid)
-            if is_test[i]:
-                ti = test_map[nid_s]
-                ar_test[ti] = d["ar_tokens"][i]
-                obs_test[ti] = d["sta_obs_tokens"][i]
-                pred_test[ti] = d["sta_pred_tokens"][i]
-                p17_test[ti] = d["sta_pred17_1664"][i]
-                test_ar_end[ti] = float(d["ar_clip_end_s"][i])
-                test_sta_end[ti] = float(d["sta_clip_end_s"][i])
-                test_use_prior[ti] = bool(d["sta_use_prior"][i])
-                filled_test[ti] = True
-            else:
-                ri = row_map[nid_s]
-                p17_tv[ri] = d["sta_pred17_1664"][i]
-                filled_tv[ri] = True
+    print(f"Consolidating {len(shards)} shards in RAM...", flush=True)
+    for s_idx, sp in enumerate(shards, 1):
+        with np.load(sp, allow_pickle=False) as d:
+            nids = d["narration_id"]
+            is_test = d["is_test"]
+            p17 = d["sta_pred17_1664"]
+            has_test = bool(np.any(is_test))
+            if has_test:
+                ar_a = d["ar_tokens"]
+                obs_a = d["sta_obs_tokens"]
+                pred_a = d["sta_pred_tokens"]
+                ar_e = d["ar_clip_end_s"]
+                sta_e = d["sta_clip_end_s"]
+                use_p = d["sta_use_prior"]
 
-    p17_tv.flush()
-    ar_test.flush(); obs_test.flush(); pred_test.flush(); p17_test.flush()
+        tv_mask = ~is_test
+        if np.any(tv_mask):
+            tv_local = np.flatnonzero(tv_mask)
+            tv_global = np.array([row_map[str(nids[i])] for i in tv_local], dtype=np.int64)
+            p17_tv[tv_global] = p17[tv_local]
+            filled_tv[tv_global] = True
 
-    test_df = pd.DataFrame({
+        if has_test:
+            te_local = np.flatnonzero(is_test)
+            te_global = np.array([test_map[str(nids[i])] for i in te_local], dtype=np.int64)
+            ar_test[te_global] = ar_a[te_local]
+            obs_test[te_global] = obs_a[te_local]
+            pred_test[te_global] = pred_a[te_local]
+            p17_test[te_global] = p17[te_local]
+            test_ar_end[te_global] = ar_e[te_local]
+            test_sta_end[te_global] = sta_e[te_local]
+            test_use_prior[te_global] = use_p[te_local]
+            filled_test[te_global] = True
+
+        if s_idx % 100 == 0 or s_idx == len(shards):
+            print(f"  [{s_idx}/{len(shards)}] tv={filled_tv.sum()}/{n_trainval} | test={filled_test.sum()}/{n_test}", flush=True)
+
+    assert filled_tv.all(), f"Missing {n_trainval - filled_tv.sum()} train/val events"
+    assert filled_test.all(), f"Missing {n_test - filled_test.sum()} test events"
+
+    print("Writing consolidated .npy files...", flush=True)
+    np.save(out_root / "sta_pred17_1664.npy", p17_tv)
+    np.save(out_root / "ar_test_tokens.npy", ar_test)
+    np.save(out_root / "sta_obs_test_tokens.npy", obs_test)
+    np.save(out_root / "sta_pred_test_tokens.npy", pred_test)
+    np.save(out_root / "sta_pred17_1664_test.npy", p17_test)
+
+    pd.DataFrame({
         "row": np.arange(n_test),
         "narration_id": [r["narration_id"] for r in test_rows],
         "video_id": [r["video_id"] for r in test_rows],
         "ar_clip_end_s": test_ar_end,
         "sta_clip_end_s": test_sta_end,
         "sta_use_prior": test_use_prior,
-    })
-    test_df.to_csv(out_root / "test_events_index.csv", index=False)
+    }).to_csv(out_root / "test_events_index.csv", index=False)
     print(f"Done! Train/val sta_pred17_1664 filled: {filled_tv.sum()}/{n_trainval} | Test filled: {filled_test.sum()}/{n_test}")
-    assert filled_tv.all(), f"Missing {n_trainval - filled_tv.sum()} train/val events"
-    assert filled_test.all(), f"Missing {n_test - filled_test.sum()} test events"
 
 
 def main():
