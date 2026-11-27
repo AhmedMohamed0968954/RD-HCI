@@ -415,3 +415,85 @@ def test_feature_keys_baseline_and_summary(toy, tmp_path):
     labels = {r["label"] for r in script("member4_gate_summary").main(
         ["--runs-dir", str(runs), "--steps", "4", "--out", str(tmp_path / "gate.md")])}
     assert "aga [memory probe steps (feature keys), pre-trained (frozen)]" in labels
+
+
+def split_off_test_files(feats, test_events):
+    """Move the test events' exact STA clips to Member 2's separate hidden-test files."""
+    import csv as _csv
+    rows = list(_csv.DictReader((feats / "events_index.csv").open(newline="")))
+    ids = {e.narration_id for e in test_events}
+    obs = np.load(feats / "sta_obs_tokens.npy")
+    keep, test = [r for r in rows if r["narration_id"] not in ids], [r for r in rows if r["narration_id"] in ids]
+    for name, part in (("events_index.csv", keep), ("test_events_index.csv", test)):
+        with (feats / name).open("w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            for i, r in enumerate(part):
+                w.writerow({**r, "row": r["row"] if name == "events_index.csv" else i})
+    np.save(feats / "sta_obs_test_tokens.npy", obs[[int(r["row"]) for r in test]])
+    return len(test)
+
+
+def test_cached_present_equals_frozen_probe_and_reads_test_clips(toy, tmp_path):
+    from torch.utils.data import DataLoader
+    from epic_starter.memory import HistoryDataset
+    from epic_starter.memory.bank import anchors_with_test
+    from epic_starter.memory.probe_steps import precompute
+    from epic_starter.models.aga import AGAMemoryModel
+    train_ev = load_events(toy / "train.csv")
+    test_ev = load_events(toy / "test.csv", labeled=False)
+    feats = tmp_path / "f16"
+    write_mock_consolidated(train_ev + test_ev, feats, tokens=24, dim=16)
+    n_test = split_off_test_files(feats, test_ev)
+    assert n_test == len(test_ev)
+    ckpt = tmp_path / "probe.pt"
+    probe_checkpoint(ckpt)
+    steps = precompute(feats, ckpt, tmp_path / "ps", batch_size=64, log=lambda m: None)
+    assert json.loads((steps / "meta.json").read_text())["test_events"]
+    assert (steps / "sta_obs_test_tokens.npy").is_file() and (steps / "test_events_index.csv").is_file()
+
+    # the present branch and the memory steps both read the hidden-test STA clips
+    bank, sbank = FeatureBank(root=feats), FeatureBank(root=steps, pooled=True)
+    obs, sobs = anchors_with_test(feats, "sta_obs_tokens.npy"), anchors_with_test(steps, "sta_obs_tokens.npy")
+    live = [e for e in test_ev if e.sta_cutoff >= 0]
+    ds_probe = HistoryDataset(train_ev[:40] + live, bank, steps=4, anchors=obs, present_tokens=True,
+                              step_bank=sbank, step_anchors=sobs)
+    assert all(int(ds_probe[40 + i]["present_source"]) == 1 for i in range(len(live)))   # exact test clips
+    ds_cached = HistoryDataset(train_ev[:40] + live, sbank, steps=4, anchors=sobs)
+
+    # cached present == frozen probe on the present clip (same weights, fp16 storage)
+    torch.manual_seed(5)
+    m_probe = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="probe", freeze_present=True,
+                             step_encoder="probe")
+    m_probe.load_present(ckpt)
+    for head in (m_probe.head_verb, m_probe.head_noun):          # a non-zero correction, to compare it too
+        torch.nn.init.normal_(head[-1].weight, std=0.1)
+    m_cached = AGAMemoryModel(feat_dim=16, d=16, heads=2, present_encoder="cached", step_encoder="probe")
+    m_cached.load_state_dict({k: v for k, v in m_probe.state_dict().items() if not k.startswith("present.")})
+    m_probe.eval(), m_cached.eval()
+    bp = next(iter(DataLoader(ds_probe, batch_size=len(ds_probe))))
+    bc = next(iter(DataLoader(ds_cached, batch_size=len(ds_cached))))
+    assert torch.equal(bp["feats"], bc["feats"])
+    with torch.no_grad():
+        op = m_probe(bp["feats"], bp["valid"], bp["present_tokens"], bp["present_source"] > 0)
+        oc = m_cached(bc["feats"], bc["valid"])
+    for k in ("verb_logits", "noun_logits"):
+        assert torch.allclose(op[k], oc[k], atol=5e-2), k
+
+    # training: cached present without the token folder, starting at the probe alone
+    train = script("train_sta_memory")
+    common = ["--train-csv", str(toy / "train.csv"), "--test-csv", str(toy / "test.csv"),
+              "--step-features", str(steps), "--steps", "4", "--d-model", "16", "--heads", "2",
+              "--num-workers", "0", "--device", "cpu", "--epochs", "1"]
+    runs = toy / "runs"
+    train.main(common + ["--present-encoder", "none", "--out-dir", str(runs / "mo")])
+    train.main(common + ["--present-encoder", "cached", "--memory-init", str(runs / "mo" / "best.pt"),
+                         "--freeze-memory", "--out-dir", str(runs / "cached")])
+    m = json.loads((runs / "cached" / "metrics.json").read_text())
+    assert m["init"]["probe_alone"] and (runs / "cached" / "test_outputs.npz").is_file()
+    train.main(common + ["--present-encoder", "cached", "--fusion", "three_way", "--branches", "present",
+                         "--out-dir", str(runs / "cached_3way_P")])
+    for bad in (["--present-encoder", "cached"], ["--present-encoder", "probe"]):
+        with pytest.raises(SystemExit):              # cached needs probe steps; probe needs the tokens
+            train.parse_args(["--train-csv", "x.csv", "--out-dir", "o"] + bad +
+                             ([] if bad[1] == "cached" else ["--step-features", str(steps)]))

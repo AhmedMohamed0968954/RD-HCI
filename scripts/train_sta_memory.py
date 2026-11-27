@@ -78,11 +78,13 @@ def parse_args(argv=None):
     m.add_argument("--heads", type=int, default=8)
     m.add_argument("--alpha", type=float, default=0.8, help="EMA weight of the newest prediction")
     m.add_argument("--dropout", type=float, default=0.5)
-    m.add_argument("--present-encoder", choices=["probe", "mean", "none"], default="probe",
+    m.add_argument("--present-encoder", choices=["probe", "mean", "none", "cached"], default="probe",
                    help="probe: Member 2's factorized probe on the present clip's 24 tokens (default); "
                         "mean: the memory's own token-mean embedding of the last step (ablation); "
                         "none: memory only, predicts from the retrieved history (memory pre-training, "
-                        "stage 1)")
+                        "stage 1); cached: with --step-features, the frozen probe's stored outputs for the "
+                        "present clip (same as probe + --freeze-present with that probe, without running it "
+                        "again; --features-dir is then optional)")
     m.add_argument("--present-init", help="Member 2's STA factorized probe checkpoint (best.pt) to start from")
     m.add_argument("--freeze-present", action="store_true", help="keep the initialised probe fixed")
     m.add_argument("--memory-init", help="best.pt of an earlier run (normally --present-encoder none) whose "
@@ -149,8 +151,14 @@ def parse_args(argv=None):
         p.error("--memory-init is for stage 2 (a model with a present encoder); stage 1 starts from scratch")
     if a.present_encoder == "none" and a.fusion != "aga":
         p.error("--present-encoder none has no present branch to fuse; use --fusion aga")
-    if a.step_features and (a.mode != "decoupled" or not a.features_dir):
-        p.error("--step-features needs --mode decoupled and the --features-dir it was computed from")
+    if a.step_features and a.mode != "decoupled":
+        p.error("--step-features needs --mode decoupled")
+    if a.present_encoder == "cached" and not a.step_features:
+        p.error("--present-encoder cached reads the probe outputs in --step-features")
+    if a.step_features and not a.features_dir and (a.present_encoder not in {"cached", "none"}
+                                                   or a.future_encoder != "none"):
+        p.error("without --features-dir, --step-features needs --present-encoder cached or none and no "
+                "future branch (the probe and the future branch read the token files)")
     if a.step_keys != "predictions" and not a.step_features:
         p.error("--step-keys features needs --step-features")
     try:
@@ -298,17 +306,18 @@ def cold_start_scores(train, manifest_dir):
 def load_step_features(a):
     """The probe-steps folder (probe_steps.py), checked against this run's features and probe."""
     from epic_starter.memory.probe_steps import same_file
-    bank = FeatureBank(root=a.step_features)                    # [M, 1, 2E+397], memory-mapped
+    bank = FeatureBank(root=a.step_features, pooled=True)       # [M, 1, 2E+397], read into RAM (~1.8 GB)
     meta = bank.meta
     if meta.get("step_features") != "member2_sta_probe":
         raise ValueError(f"{a.step_features} is not a probe-steps folder (scripts/precompute_probe_steps.py)")
-    if not same_file(meta.get("source_bank"), Path(a.features_dir) / "bank_tokens.npy"):
+    if a.features_dir and not same_file(meta.get("source_bank"), Path(a.features_dir) / "bank_tokens.npy"):
         raise ValueError(f"{a.step_features} was computed from another bank_tokens.npy than {a.features_dir}")
     if a.present_init and not same_file(meta.get("probe_checkpoint"), a.present_init):
         raise ValueError(f"{a.step_features} was computed with another probe checkpoint than --present-init "
                          f"{a.present_init}; regenerate it with scripts/precompute_probe_steps.py")
     info = {"dir": a.step_features, "probe_checkpoint": meta.get("probe_checkpoint"),
-            "source_bank": meta.get("source_bank")}
+            "source_bank": meta.get("source_bank"), "embed_dim": meta.get("embed_dim"),
+            "test_events": meta.get("test_events", False)}
     print(f"memory steps: Member 2's probe outputs from {a.step_features} "
           f"(probe {meta.get('probe_checkpoint', {}).get('path')})", flush=True)
     return bank, info
@@ -386,21 +395,27 @@ def main(argv=None):
     step_bank = step_anchors = step_info = None
     if a.step_features:                 # memory steps = Member 2's probe outputs per clip
         step_bank, step_info = load_step_features(a)
-        step_anchors = None if a.no_anchor else Anchors(a.step_features)
+        # exact STA clips of the training events + the hidden-test events (separate files) when present
+        step_anchors = None if a.no_anchor else anchors_with_test(a.step_features, "sta_obs_tokens.npy")
         pooled = False                  # the token bank is then only read for the present clip
-    if a.features_dir:
+    if a.step_features and not a.features_dir:
+        # cached present / memory only: the probe-steps folder is the only feature folder needed
+        bank, anchors, step_bank, step_anchors = step_bank, step_anchors, None, None
+    elif a.features_dir:
         bank = FeatureBank(root=a.features_dir, pooled=pooled, cache_dir=a.pool_cache)
         # the probe needs all 24 tokens of the exact STA clip; the memory uses their mean
         anchors = None
-        if not a.no_anchor and (probe or step_bank is None):
-            anchors = Anchors(a.features_dir, pooled=pooled and not probe, cache_dir=a.pool_cache)
+        if not a.no_anchor and probe:   # + hidden-test STA clips (Member 2's separate files)
+            anchors = anchors_with_test(a.features_dir, "sta_obs_tokens.npy")
+        elif not a.no_anchor and step_bank is None:
+            anchors = Anchors(a.features_dir, pooled=pooled, cache_dir=a.pool_cache)
     else:
         print("WARNING: no --features-dir, using random MOCK features (pipeline test only)")
         bank, anchors = make_mock_bank(train + val + test, tokens=24, dim=64, encode_time=False), None
         if pooled:
             bank = FeatureBank({k: v for k, v in bank.entries.items()}, pooled=True)
     T, D = bank.shape
-    D = bank.token_shape[1]
+    D = bank.token_shape[1] if step_info is None or a.features_dir else int(step_info["embed_dim"])
     future_src = None                   # Member 4: predictor tokens of the exact STA clip
     a.future_probe_mode = None
     if a.future_encoder == "probe":     # Member 2's probe mode decides the pathway and the predictor file
@@ -454,7 +469,7 @@ def main(argv=None):
 
     ctor = dict(feat_dim=D, d=a.d_model, heads=a.heads, alpha=a.alpha, mode=a.mode, dropout=a.dropout,
                 present_encoder=a.present_encoder, freeze_present=a.freeze_present,
-                freeze_memory=a.freeze_memory, step_encoder="probe" if step_bank is not None else "mean",
+                freeze_memory=a.freeze_memory, step_encoder="probe" if a.step_features else "mean",
                 step_keys=a.step_keys)
     model = AGAMemoryModel(**ctor)
     present_init = None
@@ -514,7 +529,7 @@ def main(argv=None):
     init = {"val": evaluate(p0["verb_logits"], p0["noun_logits"], p0["verb_label"], p0["noun_label"],
                             task="STA", subsets=masks),
             "breakdown": official_breakdown(p0, val, train, a.manifest_dir)[0],
-            "probe_alone": bool(present_init) and a.fusion == "aga"}
+            "probe_alone": (bool(present_init) or a.present_encoder == "cached") and a.fusion == "aga"}
     print(f"before training  val action MT5R {init['val']['all']['primary_score']:.2f}  "
           f"verb {init['val']['all']['verb_mt5r']:.2f}  noun {init['val']['all']['noun_mt5r']:.2f}"
           + ("  (= the probe alone)" if init["probe_alone"] else ""), flush=True)

@@ -7,6 +7,8 @@ every bank clip can be computed once and stored in the consolidated layout (bank
 
     <out_dir>/bank_tokens.npy     [M, 1, 2E + 97 + 300] float16, same rows as the source bank
     <out_dir>/sta_obs_tokens.npy  [N, 1, 2E + 97 + 300] float16, same rows as the source STA clips
+    <out_dir>/sta_obs_test_tokens.npy + test_events_index.csv   the same for the hidden-test STA clips,
+                                  when the source has them (Member 2's extract_pred1664_and_test.py)
     <out_dir>/bank_index.csv, events_index.csv   copied from the source (same times, same rows)
     <out_dir>/meta.json           source features, probe checkpoint, layout (written last)
 
@@ -27,6 +29,7 @@ import torch
 N_VERB, N_NOUN = 97, 300
 ARRAYS = ("bank_tokens.npy", "sta_obs_tokens.npy")
 INDEXES = ("bank_index.csv", "events_index.csv")
+TEST = ("sta_obs_test_tokens.npy", "test_events_index.csv")      # optional: hidden-test STA clips
 
 
 def layout(embed_dim: int) -> dict[str, tuple[int, int]]:
@@ -89,7 +92,8 @@ def precompute(features_dir, probe_ckpt, out_dir, batch_size: int = 512, log=pri
     embed_dim = int(np.load(src / "bank_tokens.npy", mmap_mode="r").shape[2])
     probe = load_probe(probe_ckpt, embed_dim)
     dim = step_dim(embed_dim)
-    for name in ARRAYS:
+    has_test = all((src / f).is_file() for f in TEST)
+    for name in ARRAYS + (TEST[:1] if has_test else ()):
         arr = np.load(src / name, mmap_mode="r")
         if arr.ndim != 3 or arr.shape[1] != 24 or arr.shape[2] != embed_dim:
             raise ValueError(f"{src / name}: expected [N, 24, {embed_dim}], got {arr.shape}")
@@ -106,11 +110,11 @@ def precompute(features_dir, probe_ckpt, out_dir, batch_size: int = 512, log=pri
         dst.flush()
         del dst
         os.replace(tmp, out / name)
-    for name in INDEXES:
+    for name in INDEXES + (TEST[1:] if has_test else ()):
         shutil.copyfile(src / name, out / name)
     meta = {"step_features": "member2_sta_probe", "source_features": str(src.resolve()),
             "source_bank": bank_id, "source_meta": src_meta, "probe_checkpoint": probe_id,
-            "embed_dim": embed_dim, "dim": dim, "tokens": 1, "dtype": "float16",
+            "test_events": has_test, "embed_dim": embed_dim, "dim": dim, "tokens": 1, "dtype": "float16",
             "layout": layout(embed_dim), "bank_stride_s": src_meta.get("bank_stride_s"),
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))     # last: marks the folder complete

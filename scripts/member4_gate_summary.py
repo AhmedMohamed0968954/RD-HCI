@@ -61,7 +61,8 @@ def load(runs_dir: Path, steps: int, any_present: bool = False):
         a = cfg["args"]
         if "best_val" not in m or a.get("mode") != "decoupled" or a.get("steps") != steps:
             continue
-        same_present = a.get("present_encoder", "probe") == "probe" and a.get("freeze_present")
+        same_present = (a.get("present_encoder", "probe") == "probe" and a.get("freeze_present")) or \
+            a.get("present_encoder") == "cached"          # Member 3: the same frozen probe, stored outputs
         if not any_present and (not same_present or a.get("no_anchor")):
             continue                      # same present encoder and clips as the gate rows only
         memory = memory_label(a)

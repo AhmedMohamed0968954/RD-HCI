@@ -35,6 +35,7 @@ def load_runs(root: Path):
         row = {"run": run.name, "mode": a["mode"], "steps": a["steps"], "seed": a["seed"],
                "fusion": fusion_label(a), "memory": memory_label(a),
                "present": "none (memory only)" if present == "none" else
+                          "probe (frozen, cached)" if present == "cached" else
                           present + (" (frozen)" if a.get("freeze_present") else
                                      " (trainable)" if present == "probe" else ""),
                "anchor": not a.get("no_anchor", False), "best_epoch": m["best_epoch"]}
