@@ -30,9 +30,12 @@ def run_row(run: Path) -> dict | None:
     if "best_val" not in m:
         return None                                   # still running or interrupted
     allv = m["best_val"].get("all", {})
-    tail = (m.get("best_val_breakdown") or {}).get("tail", {}).get("action_mt5r")
+    bd = m.get("best_val_breakdown") or {}
+    tail = bd.get("tail", {}).get("action_mt5r")
+    seen, unseen = bd.get("seen", {}).get("action_mt5r"), bd.get("unseen", {}).get("action_mt5r")
     row = {"action": m["best_val_action_mt5r"], "verb": allv.get("verb_mt5r"),
-           "noun": allv.get("noun_mt5r"), "tail": tail, "hist_v": None, "hist_n": None}
+           "noun": allv.get("noun_mt5r"), "tail": tail, "seen": seen, "unseen": unseen,
+           "hist_v": None, "hist_n": None}
     npz = run / "val_outputs.npz"
     if npz.is_file():
         z = np.load(npz)
@@ -75,15 +78,16 @@ def main(argv=None):
         row = run_row(run)
         if row is not None:
             groups[g][seed] = row
-    lines = ["| Configuration | Seeds | Action MT5R | Verb MT5R | Noun MT5R | Tail action | History (verb / noun) |",
-             "|---|---|---|---|---|---|---|"]
+    lines = ["| Configuration | Seeds | Action MT5R | Seen | Unseen | Verb MT5R | Noun MT5R | Tail action "
+             "| History (verb / noun) |", "|---|---|---|---|---|---|---|---|---|"]
     for g, runs in sorted(groups.items()):
         rows = list(runs.values())
         col = lambda k: [r[k] for r in rows]
         seeds = ",".join(str(s) for s in sorted(runs, key=lambda s: (s is None, s)) if s is not None) or "–"
         hist = f"{fmt(col('hist_v'), sd=False)} / {fmt(col('hist_n'), sd=False)}" \
             if any(r["hist_v"] is not None for r in rows) else "–"
-        lines.append(f"| {g} | {seeds} | {fmt(col('action'))} | {fmt(col('verb'), sd=False)} | "
+        lines.append(f"| {g} | {seeds} | {fmt(col('action'))} | {fmt(col('seen'))} | {fmt(col('unseen'))} | "
+                     f"{fmt(col('verb'), sd=False)} | "
                      f"{fmt(col('noun'), sd=False)} | {fmt(col('tail'), sd=False)} | {hist} |")
     table = "\n".join(lines)
     print(table)

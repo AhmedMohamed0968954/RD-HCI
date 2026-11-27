@@ -78,18 +78,27 @@ def eval_action_subsets(topa: np.ndarray, ya: np.ndarray, unseen_m: np.ndarray, 
     return out
 
 
-def main():
-    m_dir = Path("manifests/hybrid-v3")
-    res_root = Path("/lustre1/scratch/394/vsc39484/epic-kitchens/team/results/member2_probe_hybrid")
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Post-hoc calibration study (defaults: Member 2's probes).")
+    ap.add_argument("--res-root", default="/lustre1/scratch/394/vsc39484/epic-kitchens/team/results/member2_probe_hybrid")
+    ap.add_argument("--sta-run", action="append", default=[],
+                    help="extra STA run name with {seed}, e.g. decoupled_S16_seed{seed}_psteps_warm_frozenmem "
+                         "(Member 3); replaces the default model list when given")
+    ap.add_argument("--manifest-dir", default="manifests/hybrid-v3")
+    args = ap.parse_args(argv)
+    m_dir = Path(args.manifest_dir)
+    res_root = Path(args.res_root)
     tail_info = json.loads((m_dir / "tail_classes.json").read_text(encoding="utf-8"))
     tail_verbs = set(tail_info["verbs"])
     tail_nouns = set(tail_info["nouns"])
 
-    for task, model_name, metric in [
+    models = [("STA", run, "mt5r") for run in args.sta_run] or [
         ("AR", "AR_factorized", "top1"),
         ("STA", "STA_factorized", "mt5r"),
         ("STA", "STA_factorized_pred_1664", "mt5r"),
-    ]:
+    ]
+    for task, model_name, metric in models:
         train_rows = read_manifest(m_dir / f"train_{task.lower()}.jsonl")
         val_rows = read_manifest(m_dir / f"val_{task.lower()}.jsonl")
         val_by_id = {r["narration_id"]: r for r in val_rows}
@@ -126,10 +135,13 @@ def main():
         chosen_params = []
 
         for seed in [42, 1, 2]:
-            d = np.load(res_root / f"{model_name}_seed{seed}" / "val_outputs.npz")
+            run = model_name.format(seed=seed) if "{seed}" in model_name else f"{model_name}_seed{seed}"
+            d = np.load(res_root / run / "val_outputs.npz")
             ordered_rows = [val_by_id[str(nid)] for nid in d["narration_id"]]
             zv, zn = d["verb_logits"], d["noun_logits"]
-            yv, yn = d["verb_labels"], d["noun_labels"]
+            # Member 2's probes save verb_labels / noun_labels, Member 3's memory runs verb_label / noun_label
+            yv = d["verb_labels"] if "verb_labels" in d.files else d["verb_label"]
+            yn = d["noun_labels"] if "noun_labels" in d.files else d["noun_label"]
             ya = yv * NUM_NOUNS + yn
             unseen_m = np.array([r["participant_id"] not in train_parts for r in ordered_rows])
             tail_m = np.array([(int(v) in tail_verbs) or (int(n) in tail_nouns) for v, n in zip(yv, yn)])
