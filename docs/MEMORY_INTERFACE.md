@@ -175,6 +175,18 @@ its predictions, nothing else changed). One row per configuration, mean ± sd ov
 weights: `scripts/sta_memory_summary.py --runs-dir "$EPIC_TEAM/results/sta_memory" [--match psteps]`
 (on a compute node; see its header).
 
+### Team split (hybrid-v3)
+
+`scripts/sta_memory_hybrid.slurm <seed>`: probe steps of Member 2's `STA_factorized_seed<s>`
+(including the hidden-test STA clips from Member 2's `*_test` files), then stage 1, the frozen stage-2
+AGA row, the present-only control, the scratch memory and the plain-attention baseline. Paths match
+`member4_gate_fix.slurm` (`$EPIC_TEAM/cache/probe_steps/hybrid-v3_seed<s>`,
+`$EPIC_TEAM/results/sta_memory_hybrid-v3`). `--present-encoder cached` reads the frozen probe's stored
+outputs for the present clip from the last memory step instead of running the probe again (same result,
+see `test_cached_present_equals_frozen_probe_and_reads_test_clips`); with it the run needs only the
+probe-steps folder (~2 GB), not the 17 GB token bank. The present branch (`probe`) and the memory steps
+now both read the hidden-test STA clips, so test events no longer fall back to the last bank clip.
+
 Measured cost: data loading ~0.25 ms/event; with the probe ~1.4 s per batch of 256 on 2 cores,
 i.e. about a minute per epoch on an 18-core Ice Lake node. Optional GPU: add
 `-p gpu_p100 --gpus-per-node=1` to `sbatch` and `export EPIC_GPU_ENV=<CUDA venv>`.

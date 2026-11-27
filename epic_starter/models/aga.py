@@ -95,6 +95,9 @@ class AGAMemoryModel(nn.Module):
                              checkpoint starts exactly at the probe's score.
     present_encoder="none"   memory only (stage 1 of memory pre-training): no present branch and no
                              gate; the verb/noun heads read the retrieved history h directly.
+    present_encoder="cached" the frozen probe's outputs on the present clip read from the last memory
+                             step (step_encoder="probe": that row is the probe on the same clip), so
+                             the probe is not run again; otherwise exactly the frozen "probe" encoder.
     freeze_memory=True       keep the memory part (memory_parts()) fixed, e.g. after `load_memory`.
     """
 
@@ -104,8 +107,11 @@ class AGAMemoryModel(nn.Module):
         super().__init__()
         if mode not in {"single", "decoupled"}:
             raise ValueError("mode must be single or decoupled")
-        if present_encoder not in {"mean", "probe", "none"}:
-            raise ValueError("present_encoder must be mean, probe or none")
+        if present_encoder not in {"mean", "probe", "none", "cached"}:
+            raise ValueError("present_encoder must be mean, probe, cached or none")
+        if present_encoder == "cached" and step_encoder != "probe":
+            raise ValueError("present_encoder='cached' reads the probe outputs of the last step: "
+                             "needs step_encoder='probe'")
         if step_encoder not in {"mean", "probe"}:
             raise ValueError("step_encoder must be mean or probe")
         if step_encoder == "probe" and mode != "decoupled":
@@ -137,15 +143,16 @@ class AGAMemoryModel(nn.Module):
             self.gate_v, self.gate_n = Gate(d), Gate(d)
         self.head_verb = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_VERB))
         self.head_noun = nn.Sequential(nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, N_NOUN))
-        if present_encoder == "probe":
-            from epic_starter.models.factorized_probe import FactorizedAttentiveProbe   # Member 2
-            self.present = FactorizedAttentiveProbe(embed_dim=feat_dim, mode="factorized")
+        if present_encoder in {"probe", "cached"}:
+            if present_encoder == "probe":
+                from epic_starter.models.factorized_probe import FactorizedAttentiveProbe   # Member 2
+                self.present = FactorizedAttentiveProbe(embed_dim=feat_dim, mode="factorized")
             self.present_v = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, d))
             self.present_n = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, d))
             for head in (self.head_verb, self.head_noun):         # memory starts as a zero correction
                 nn.init.zeros_(head[-1].weight)
                 nn.init.zeros_(head[-1].bias)
-            if freeze_present:
+            if freeze_present and present_encoder == "probe":
                 self.present.requires_grad_(False)
         if freeze_memory:
             for part in self.memory_parts().values():
@@ -232,6 +239,13 @@ class AGAMemoryModel(nn.Module):
         elif self.present_encoder == "none":                       # memory only: no present branch
             zeros = torch.zeros_like(sv[:, -1])
             z.update(verb_present=zeros, noun_present=zeros, present_available=torch.zeros_like(valid[:, -1]))
+        elif self.present_encoder == "cached":                     # frozen probe outputs of the last step
+            avail = valid[:, -1]
+            keep = avail[:, None].float()
+            last = lambda k: x[:, -1, slice(*self.step_layout[k])]
+            z.update(verb_present=self.present_v(last("verb_emb")) * keep,
+                     noun_present=self.present_n(last("noun_emb")) * keep, present_available=avail,
+                     base_verb_logits=last("verb_logits") * keep, base_noun_logits=last("noun_logits") * keep)
         else:
             if present_tokens is None or present_available is None:
                 raise ValueError("present_encoder='probe' needs present_tokens and present_available")
@@ -302,7 +316,7 @@ class GatedAGAModel(nn.Module):
             raise ValueError("GatedAGAModel needs a present encoder (memory-only models have no present branch)")
         if not 0.0 <= branch_dropout < 1.0:
             raise ValueError(f"branch_dropout must be in [0, 1), got {branch_dropout}")
-        if gate_uncertainty and memory.present_encoder != "probe":
+        if gate_uncertainty and memory.present_encoder not in {"probe", "cached"}:
             raise ValueError("gate_uncertainty needs the probe present encoder (its predictions)")
         if getattr(head, "extra_dim", 0) != (2 if gate_uncertainty else 0):
             raise ValueError("the head's extra_dim must be 2 with gate_uncertainty, else 0")
@@ -313,7 +327,7 @@ class GatedAGAModel(nn.Module):
         self.branches = tuple(b for b in self.BRANCHES if b in branches)
         self.register_buffer("branch_mask", torch.tensor([b in branches for b in self.BRANCHES]),
                              persistent=False)
-        if memory.present_encoder == "probe":
+        if memory.present_encoder in {"probe", "cached"}:           # zero correction on the probe
             for lin in (head.verb_head, head.noun_head):
                 nn.init.zeros_(lin.weight)
                 nn.init.zeros_(lin.bias)
